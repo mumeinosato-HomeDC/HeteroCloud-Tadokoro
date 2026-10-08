@@ -1,0 +1,42 @@
+image:
+  repository: ghcr.io/mumeinosato-homedc/heterocloud-tadokoro
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# Tadokoro keeps no state outside Proxmox and allocates VMIDs and addresses in
+# process, so it must run as exactly one replica.
+replicaCount: 1
+
+providerAuth:
+  issuer: heterocloud
+  audience: heterocloud-vm
+  # Ed25519 verification keys as {kid: PEM}; public information.
+  publicKeysJson: ""
+
+pve:
+  url: ""                 # https://<node>:8006
+  node: pve02             # every VM is created here
+  tokenId: tadokoro@pve!provider
+  # Secret with the key `token-secret`.
+  tokenSecretName: tadokoro-pve
+  # Optional ConfigMap with key `ca.crt` that signs the Proxmox API certificate.
+  caConfigMapName: ""
+  storage: local-lvm
+
+vm:
+  region: heteronet-global
+  images: { ubuntu-26.04: 9000 }     # image name -> template VMID on the node
+  bridge: hcnet
+  ipPool: 10.100.16.0/20
+  networkPrefix: 16
+  gateway: 10.100.0.1
+  nameserver: 10.100.0.2
+  searchDomain: hetero.internal
+  maxVms: 32
+
+resources:
+  requests: { cpu: 50m, memory: 64Mi }
+  limits: { cpu: 500m, memory: 256Mi }
+
+nodeSelector: {}
+tolerations: []

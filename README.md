@@ -1,4 +1,20 @@
-# repo-template
+# HeteroCloud Tadokoro
+
+HeteroCloud の `provider/v1` に対応した Proxmox VE 用 VM プロバイダーです。
+署名付きコマンドを受け取り、`pve02` 上に cloud-init 済みの VM を作成・更新・削除します。
+設計は [docs/DESIGN.md](docs/DESIGN.md) を参照してください。
+
+```bash
+cargo test                                   # モック Proxmox を使った結合テスト
+docker build -t heterocloud-tadokoro .       # イメージ
+scripts/pve-setup.sh                         # PVE 側のロール/ユーザー/APIトークン (root)
+scripts/make-template.sh ...                 # cloud-init テンプレート VM (root)
+helm install tadokoro deploy/helm/heterocloud-tadokoro -f values.yaml
+```
+
+---
+
+# 開発ルール (repo-template)
 
 NCチームで使用する開発環境のテンプレートです．
 
