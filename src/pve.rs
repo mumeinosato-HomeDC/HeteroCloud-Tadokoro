@@ -7,6 +7,8 @@ use reqwest::{Method, StatusCode};
 use serde::Deserialize;
 use serde_json::Value;
 use thiserror::Error;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 
 #[derive(Debug, Error)]
 pub enum PveError {
@@ -27,6 +29,19 @@ pub struct PveClient {
     base: String,
     authorization: String,
     node: String,
+    base_url: String,
+    ca_pem: Option<Vec<u8>>,
+}
+
+/// A WebSocket to the Proxmox serial terminal proxy.
+pub type TerminalSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// What `termproxy` hands out: the one-time credentials for the terminal socket.
+#[derive(Clone, Debug)]
+pub struct TermProxy {
+    pub port: u16,
+    pub ticket: String,
+    pub user: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -117,6 +132,8 @@ impl PveClient {
             base: format!("{}/api2/json", base_url.trim_end_matches('/')),
             authorization: format!("PVEAPIToken={token_id}={token_secret}"),
             node: node.to_owned(),
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            ca_pem: ca_pem.map(<[u8]>::to_vec),
         })
     }
 
@@ -387,6 +404,79 @@ impl PveClient {
         )
         .await
         .map(|_| ())
+    }
+
+    /// Starts a serial terminal proxy for the VM and returns its one-time credentials.
+    pub async fn termproxy(&self, vmid: u32) -> Result<TermProxy, PveError> {
+        let data = self
+            .call(Method::POST, &self.qemu(vmid, "/termproxy"), &[])
+            .await?;
+        let field = |name: &str| data.get(name).cloned().unwrap_or(Value::Null);
+        let port = field("port")
+            .as_u64()
+            .or_else(|| field("port").as_str().and_then(|p| p.parse().ok()))
+            .and_then(|p| u16::try_from(p).ok());
+        match (port, field("ticket").as_str(), field("user").as_str()) {
+            (Some(port), Some(ticket), Some(user)) => Ok(TermProxy {
+                port,
+                ticket: ticket.to_owned(),
+                user: user.to_owned(),
+            }),
+            _ => Err(PveError::Unavailable(
+                "unexpected termproxy response".into(),
+            )),
+        }
+    }
+
+    /// Connects to the terminal proxy started by [`Self::termproxy`].
+    pub async fn connect_terminal(
+        &self,
+        vmid: u32,
+        proxy: &TermProxy,
+    ) -> Result<TerminalSocket, PveError> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let ws_base = self
+            .base_url
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let url = format!(
+            "{ws_base}/api2/json/nodes/{}/qemu/{vmid}/vncwebsocket?port={}&vncticket={}",
+            self.node,
+            proxy.port,
+            percent_encode(&proxy.ticket)
+        );
+        let mut request = url
+            .into_client_request()
+            .map_err(|e| PveError::Unavailable(e.to_string()))?;
+        let header = self
+            .authorization
+            .parse()
+            .map_err(|_| PveError::Unavailable("invalid token header".into()))?;
+        request.headers_mut().insert("Authorization", header);
+        let connector = match &self.ca_pem {
+            Some(pem) => {
+                use rustls::pki_types::{CertificateDer, pem::PemObject};
+                let mut roots = rustls::RootCertStore::empty();
+                for cert in CertificateDer::pem_slice_iter(pem).flatten() {
+                    roots
+                        .add(cert)
+                        .map_err(|e| PveError::Unavailable(e.to_string()))?;
+                }
+                let config = rustls::ClientConfig::builder()
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
+                Some(Connector::Rustls(std::sync::Arc::new(config)))
+            }
+            None => None,
+        };
+        let (socket, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector),
+        )
+        .await
+        .map_err(|_| PveError::Unavailable("terminal connection timed out".into()))?
+        .map_err(|e| PveError::Unavailable(e.to_string()))?;
+        Ok(socket)
     }
 
     pub async fn destroy(&self, vmid: u32) -> Result<(), PveError> {
