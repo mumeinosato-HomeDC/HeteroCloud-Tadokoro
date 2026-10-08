@@ -740,9 +740,7 @@ impl Reconciler {
             self.ensure_firewall(vm.vmid, &meta.spec, ip).await?;
         }
         match (power, meta.spec.stopped) {
-            ("running", false) | ("stopped", true) => {
-                Ok(Self::status_json(vm, config, meta, power))
-            }
+            ("running", false) | ("stopped", true) => Ok(self.status_json(vm, config, meta, power)),
             ("stopped", false) => {
                 self.pve.start(vm.vmid).await?;
                 Err(ReconcileError::NotReady)
@@ -755,7 +753,27 @@ impl Reconciler {
         }
     }
 
-    fn status_json(vm: &PveVm, config: &VmConfig, meta: &VmMeta, power: &str) -> Value {
+    /// DNS names the VM is registered under (empty when DNS registration is off).
+    fn dns_names(&self, meta: &VmMeta) -> Vec<String> {
+        let Some(updater) = &self.dns else {
+            return Vec::new();
+        };
+        let zone = updater.zone();
+        let mut names = vec![dns::vm_canonical_name(
+            zone,
+            &meta.name,
+            meta.service_instance_id,
+        )];
+        if let Some(vpc) = meta.spec.network.vpc_id {
+            names.push(dns::vm_vpc_alias(zone, &meta.name, vpc));
+        }
+        names
+            .into_iter()
+            .map(|n| n.trim_end_matches('.').to_owned())
+            .collect()
+    }
+
+    fn status_json(&self, vm: &PveVm, config: &VmConfig, meta: &VmMeta, power: &str) -> Value {
         json!({
             "phase": "ready",
             "observed_generation": meta.applied_generation,
@@ -771,6 +789,7 @@ impl Reconciler {
             "username": meta.spec.username,
             "vpc_id": meta.spec.network.vpc_id,
             "firewall": "enforced",
+            "dns_names": self.dns_names(meta),
         })
     }
 
@@ -835,7 +854,7 @@ impl Reconciler {
             return Err(ReconcileError::NotReady);
         }
         let power = self.pve.power_state(vm.vmid).await?;
-        Ok(Self::status_json(&vm, &config, &meta, &power))
+        Ok(self.status_json(&vm, &config, &meta, &power))
     }
 }
 

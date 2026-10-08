@@ -478,6 +478,11 @@ async fn firewall_is_enforced_before_the_vm_starts() {
     });
     let body = converge(&h, instance, 1, "fw", spec_with(network)).await;
     assert_eq!(body["status"]["firewall"], "enforced");
+    assert_eq!(
+        body["status"]["dns_names"],
+        json!([]),
+        "no DNS names without a DNS server"
+    );
     let (vmid, vm) = vm_of(&h, instance);
     assert!(
         vm.config["net0"].split(',').any(|p| p == "firewall=1"),
