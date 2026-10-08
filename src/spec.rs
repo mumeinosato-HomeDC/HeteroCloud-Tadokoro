@@ -274,10 +274,44 @@ fn validate_ssh_key(value: &str) -> Result<(), SpecError> {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'='));
     // The comment may contain spaces but never control characters or newlines.
     let clean = value.len() <= 8192 && !value.chars().any(char::is_control);
-    if TYPES.contains(&kind) && blob_ok && clean {
+    if TYPES.contains(&kind) && blob_ok && clean && key_blob_matches(kind, blob) {
         Ok(())
     } else {
         invalid("ssh_authorized_keys entries must be OpenSSH public keys")
+    }
+}
+
+/// Whether `blob` is a well-formed OpenSSH public key body of type `kind`: Proxmox rejects
+/// keys it cannot parse, which would otherwise leave the VM retrying forever.
+fn key_blob_matches(kind: &str, blob: &str) -> bool {
+    use base64::Engine as _;
+    let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(blob) else {
+        return false;
+    };
+    let mut rest = bytes.as_slice();
+    let mut fields: Vec<&[u8]> = Vec::new();
+    while !rest.is_empty() {
+        let Some((len, tail)) = rest.split_first_chunk::<4>() else {
+            return false;
+        };
+        let len = u32::from_be_bytes(*len) as usize;
+        if len > tail.len() {
+            return false;
+        }
+        let (field, tail) = tail.split_at(len);
+        fields.push(field);
+        rest = tail;
+    }
+    let Some((name, body)) = fields.split_first() else {
+        return false;
+    };
+    if *name != kind.as_bytes() {
+        return false;
+    }
+    match kind {
+        "ssh-ed25519" => body.len() == 1 && body[0].len() == 32,
+        "ssh-rsa" => body.len() == 2 && !body[0].is_empty() && body[1].len() >= 128,
+        _ => body.len() == 2 && !body[1].is_empty(),
     }
 }
 
@@ -345,6 +379,11 @@ mod tests {
         s.username = "root".into();
         assert!(s.validate("heteronet-global", &images()).is_err());
         let mut s = spec();
+        s.ssh_authorized_keys = vec!["ssh-ed25519 AAAAAjiosdjgdsgsdg0964tlsjgsdjgsodjgsdg".into()];
+        assert!(
+            s.validate("heteronet-global", &images()).is_err(),
+            "well-shaped but not a key"
+        );
         s.ssh_authorized_keys = vec!["not a key".into()];
         assert!(s.validate("heteronet-global", &images()).is_err());
         let mut s = spec();
