@@ -52,6 +52,12 @@ spec:
             - { name: TADOKORO_NAMESERVER, value: {{ .Values.vm.nameserver | quote }} }
             - { name: TADOKORO_SEARCH_DOMAIN, value: {{ .Values.vm.searchDomain | quote }} }
             - { name: TADOKORO_MAX_VMS, value: {{ .Values.vm.maxVms | quote }} }
+            {{- if .Values.dns.enabled }}
+            - { name: TADOKORO_DNS_SERVER, value: {{ required "dns.server is required" .Values.dns.server | quote }} }
+            - { name: TADOKORO_DNS_KEY_FILE, value: /var/run/secrets/dns/tsig.key }
+            - { name: TADOKORO_DNS_ZONE, value: {{ .Values.dns.zone | quote }} }
+            - { name: TADOKORO_DNS_TTL, value: {{ .Values.dns.ttl | quote }} }
+            {{- end }}
             {{- if .Values.flash.enabled }}
             - { name: TADOKORO_FLASH_NAMESPACE, value: {{ .Values.flash.namespace | quote }} }
             - { name: TADOKORO_FLASH_SNAT_ADDRESSES, value: {{ join "," .Values.flash.snatAddresses | quote }} }
@@ -73,10 +79,17 @@ spec:
             capabilities: { drop: [ALL] }
           volumeMounts:
             - { name: pve, mountPath: /var/run/secrets/pve, readOnly: true }
+            {{- if .Values.dns.enabled }}
+            - { name: dns, mountPath: /var/run/secrets/dns, readOnly: true }
+            {{- end }}
             {{- if .Values.pve.caConfigMapName }}
             - { name: pve-ca, mountPath: /var/run/secrets/pve-ca, readOnly: true }
             {{- end }}
       volumes:
+        {{- if .Values.dns.enabled }}
+        - name: dns
+          secret: { secretName: {{ .Values.dns.keySecretName | quote }}, defaultMode: 0440 }
+        {{- end }}
         - name: pve
           secret: { secretName: {{ .Values.pve.tokenSecretName | quote }}, defaultMode: 0440 }
         {{- if .Values.pve.caConfigMapName }}

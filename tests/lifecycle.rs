@@ -97,6 +97,7 @@ async fn harness(max_vms: usize) -> Harness {
             flash_snat: vec![Ipv4Addr::new(10, 100, 0, 10)],
         },
         Some(FlashDirectory::new(&kube_url, "flash-workloads", "token", None).unwrap()),
+        None,
     );
     let authenticator = ProviderAuthenticator::from_public_keys_json(
         "heterocloud",

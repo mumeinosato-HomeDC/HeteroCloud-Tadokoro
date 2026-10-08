@@ -44,6 +44,15 @@ flash:
   snatAddresses: []
   syncSeconds: 30
 
+# Registers names for VMs and the VM-facing addresses of Flash services through RFC 2136.
+dns:
+  enabled: false
+  server: ""                 # host:port of the primary, e.g. 10.100.0.2:53
+  zone: hetero.internal
+  ttl: 60
+  # Secret with the BIND-format TSIG key under the key `tsig.key`.
+  keySecretName: tadokoro-dns
+
 resources:
   requests: { cpu: 50m, memory: 64Mi }
   limits: { cpu: 500m, memory: 256Mi }

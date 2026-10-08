@@ -85,6 +85,17 @@ pub struct Config {
     /// How often VPC membership and Flash addresses are re-synchronised.
     #[arg(long, env = "TADOKORO_VPC_SYNC_SECONDS", default_value_t = 30)]
     pub vpc_sync_seconds: u64,
+    /// DNS server (`host:port`) that accepts RFC 2136 updates for the zone. Together
+    /// with `--dns-key-file` this registers names for VMs and Flash services.
+    #[arg(long, env = "TADOKORO_DNS_SERVER")]
+    pub dns_server: Option<String>,
+    /// BIND-format TSIG key file (`key "name" { algorithm …; secret "…"; };`).
+    #[arg(long, env = "TADOKORO_DNS_KEY_FILE")]
+    pub dns_key_file: Option<PathBuf>,
+    #[arg(long, env = "TADOKORO_DNS_ZONE", default_value = "hetero.internal")]
+    pub dns_zone: String,
+    #[arg(long, env = "TADOKORO_DNS_TTL", default_value_t = 60)]
+    pub dns_ttl: u32,
     /// Upper bound of VMs this provider keeps at once.
     #[arg(long, env = "TADOKORO_MAX_VMS", default_value_t = 32)]
     pub max_vms: usize,
