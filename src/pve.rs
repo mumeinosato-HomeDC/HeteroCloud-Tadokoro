@@ -275,6 +275,120 @@ impl PveClient {
             .map(|_| ())
     }
 
+    fn firewall(&self, vmid: u32, suffix: &str) -> String {
+        format!("/nodes/{}/qemu/{}/firewall{}", self.node, vmid, suffix)
+    }
+
+    pub async fn fw_options(&self, vmid: u32) -> Result<VmConfig, PveError> {
+        let data = self
+            .call(Method::GET, &self.firewall(vmid, "/options"), &[])
+            .await?;
+        let map: BTreeMap<String, Value> =
+            serde_json::from_value(data).map_err(|e| PveError::Unavailable(e.to_string()))?;
+        Ok(VmConfig(map))
+    }
+
+    pub async fn set_fw_options(
+        &self,
+        vmid: u32,
+        params: &[(&str, String)],
+    ) -> Result<(), PveError> {
+        self.call(Method::PUT, &self.firewall(vmid, "/options"), params)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn fw_rules(&self, vmid: u32) -> Result<Vec<Value>, PveError> {
+        let data = self
+            .call(Method::GET, &self.firewall(vmid, "/rules"), &[])
+            .await?;
+        serde_json::from_value(data).map_err(|e| PveError::Unavailable(e.to_string()))
+    }
+
+    pub async fn add_fw_rule(&self, vmid: u32, params: &[(&str, String)]) -> Result<(), PveError> {
+        self.call(Method::POST, &self.firewall(vmid, "/rules"), params)
+            .await
+            .map(|_| ())
+    }
+
+    pub async fn delete_fw_rule(&self, vmid: u32, pos: u64) -> Result<(), PveError> {
+        self.call(
+            Method::DELETE,
+            &self.firewall(vmid, &format!("/rules/{pos}")),
+            &[],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn fw_ipsets(&self, vmid: u32) -> Result<Vec<String>, PveError> {
+        let data = self
+            .call(Method::GET, &self.firewall(vmid, "/ipset"), &[])
+            .await?;
+        let items: Vec<Value> =
+            serde_json::from_value(data).map_err(|e| PveError::Unavailable(e.to_string()))?;
+        Ok(items
+            .iter()
+            .filter_map(|i| i.get("name").and_then(Value::as_str).map(str::to_owned))
+            .collect())
+    }
+
+    pub async fn create_fw_ipset(&self, vmid: u32, name: &str) -> Result<(), PveError> {
+        self.call(
+            Method::POST,
+            &self.firewall(vmid, "/ipset"),
+            &[("name", name.to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn fw_ipset_entries(&self, vmid: u32, name: &str) -> Result<Vec<String>, PveError> {
+        let data = self
+            .call(
+                Method::GET,
+                &self.firewall(vmid, &format!("/ipset/{name}")),
+                &[],
+            )
+            .await?;
+        let items: Vec<Value> =
+            serde_json::from_value(data).map_err(|e| PveError::Unavailable(e.to_string()))?;
+        Ok(items
+            .iter()
+            .filter_map(|i| i.get("cidr").and_then(Value::as_str).map(str::to_owned))
+            .collect())
+    }
+
+    pub async fn add_fw_ipset_entry(
+        &self,
+        vmid: u32,
+        name: &str,
+        cidr: &str,
+    ) -> Result<(), PveError> {
+        self.call(
+            Method::POST,
+            &self.firewall(vmid, &format!("/ipset/{name}")),
+            &[("cidr", cidr.to_owned())],
+        )
+        .await
+        .map(|_| ())
+    }
+
+    pub async fn delete_fw_ipset_entry(
+        &self,
+        vmid: u32,
+        name: &str,
+        cidr: &str,
+    ) -> Result<(), PveError> {
+        self.call(
+            Method::DELETE,
+            &self.firewall(vmid, &format!("/ipset/{name}/{cidr}")),
+            &[],
+        )
+        .await
+        .map(|_| ())
+    }
+
     pub async fn destroy(&self, vmid: u32) -> Result<(), PveError> {
         self.call(
             Method::DELETE,

@@ -7,9 +7,10 @@
 //! accepted generation and spec as JSON.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
     net::Ipv4Addr,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use ipnet::Ipv4Net;
@@ -21,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::ProviderClaims,
+    firewall::{self, IPFILTER_IPSET, VPC_IPSET},
     ipam::{self, parse_ip_tag},
     pve::{PveClient, PveError, PveVm, VmConfig, percent_encode},
     spec::{VmSpec, slug},
@@ -78,7 +80,12 @@ pub struct Reconciler {
     settings: Settings,
     /// Serialises VMID and address allocation (the provider runs one replica).
     allocation: Mutex<()>,
+    /// VMs cloned moments ago. `cluster/resources` lags by several seconds, so
+    /// without this a quick retry could clone the same instance twice.
+    recent: std::sync::Mutex<HashMap<Uuid, (PveVm, Instant)>>,
 }
+
+const RECENT_TTL: Duration = Duration::from_secs(180);
 
 /// Names of provider-managed VMs end in `-<32 hex>`, the instance id.
 fn managed_name(name: &str) -> bool {
@@ -95,6 +102,7 @@ impl Reconciler {
             pve,
             settings,
             allocation: Mutex::new(()),
+            recent: std::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -111,13 +119,55 @@ impl Reconciler {
         format!("{}-{}", slug(display), instance.simple())
     }
 
+    fn recent_vm(&self, instance: Uuid) -> Option<PveVm> {
+        let mut recent = self.recent.lock().ok()?;
+        recent.retain(|_, (_, at)| at.elapsed() < RECENT_TTL);
+        recent.get(&instance).map(|(vm, _)| vm.clone())
+    }
+
+    fn forget_recent(&self, instance: Uuid) {
+        if let Ok(mut recent) = self.recent.lock() {
+            recent.remove(&instance);
+        }
+    }
+
+    /// Provider-managed VMs, including ones too new to appear in the resource list.
+    async fn managed(&self) -> Result<Vec<PveVm>, PveError> {
+        let mut vms: Vec<PveVm> = self
+            .pve
+            .list_vms()
+            .await?
+            .into_iter()
+            .filter(|vm| vm.name.as_deref().is_some_and(managed_name))
+            .collect();
+        if let Ok(recent) = self.recent.lock() {
+            for (vm, at) in recent.values() {
+                if at.elapsed() < RECENT_TTL && !vms.iter().any(|v| v.vmid == vm.vmid) {
+                    vms.push(vm.clone());
+                }
+            }
+        }
+        Ok(vms)
+    }
+
     async fn find(&self, instance: Uuid) -> Result<Option<PveVm>, PveError> {
         let suffix = format!("-{}", instance.simple());
-        Ok(self.pve.list_vms().await?.into_iter().find(|vm| {
+        if let Some(vm) = self.recent_vm(instance) {
+            match self.pve.config(vm.vmid).await {
+                Ok(_) | Err(PveError::Locked) => return Ok(Some(vm)),
+                Err(PveError::NotFound) => self.forget_recent(instance),
+                Err(error) => return Err(error),
+            }
+        }
+        let found = self.pve.list_vms().await?.into_iter().find(|vm| {
             vm.name
                 .as_deref()
                 .is_some_and(|n| managed_name(n) && n.ends_with(&suffix))
-        }))
+        });
+        if found.is_some() {
+            self.forget_recent(instance);
+        }
+        Ok(found)
     }
 
     fn meta_of(config: &VmConfig) -> Option<VmMeta> {
@@ -181,6 +231,7 @@ impl Reconciler {
                 spec: spec.clone(),
             },
         };
+        let previous_vpc = meta.spec.network.vpc_id;
         if generation > meta.generation {
             Self::check_update_allowed(&config, &meta, spec)?;
             meta.generation = generation;
@@ -193,8 +244,9 @@ impl Reconciler {
         }
 
         let power = self.pve.power_state(vm.vmid).await?;
-        if meta.applied_generation < meta.generation {
-            self.apply(&vm, &config, meta, &power).await?;
+        // VMs created before the firewall existed are brought under it as well.
+        if meta.applied_generation < meta.generation || !has_firewall_flag(&config) {
+            self.apply(&vm, &config, meta, &power, previous_vpc).await?;
             return Err(ReconcileError::NotReady);
         }
         self.settle(&vm, &config, &meta, &power).await
@@ -236,12 +288,7 @@ impl Reconciler {
         if self.find(instance).await?.is_some() {
             return Ok(());
         }
-        let vms = self.pve.list_vms().await?;
-        let managed = vms
-            .iter()
-            .filter(|vm| vm.name.as_deref().is_some_and(managed_name))
-            .count();
-        if managed >= self.settings.max_vms {
+        if self.managed().await?.len() >= self.settings.max_vms {
             return Err(ReconcileError::Capacity(format!(
                 "at most {} VMs",
                 self.settings.max_vms
@@ -252,14 +299,21 @@ impl Reconciler {
                 ReconcileError::BadRequest(format!("unknown image {}", spec.image))
             })?;
         let vmid = self.pve.next_id().await?;
+        let vm_name = Self::vm_name(name, instance);
         self.pve
-            .clone_template(
-                template,
-                vmid,
-                &Self::vm_name(name, instance),
-                &self.settings.storage,
-            )
+            .clone_template(template, vmid, &vm_name, &self.settings.storage)
             .await?;
+        if let Ok(mut recent) = self.recent.lock() {
+            let vm = PveVm {
+                vmid,
+                name: Some(vm_name),
+                node: self.pve.node().to_owned(),
+                status: "stopped".into(),
+                template: 0,
+                tags: None,
+            };
+            recent.insert(instance, (vm, Instant::now()));
+        }
         Ok(())
     }
 
@@ -280,38 +334,56 @@ impl Reconciler {
             || config.u64("memory") != Some(u64::from(spec.memory_mib))
             || config.str("ciuser").as_deref() != Some(spec.username.as_str())
             || keys_now.trim() != Self::desired_sshkeys(spec).trim()
+            || !has_firewall_flag(config)
+    }
+
+    fn tags_for(ip: Ipv4Addr, vpc: Option<Uuid>) -> String {
+        let mut tags = format!("{TAG_MARKER};{}", ipam::ip_tag(ip));
+        if let Some(vpc) = vpc {
+            tags.push(';');
+            tags.push_str(&vpc_tag(vpc));
+        }
+        tags
+    }
+
+    fn tag_values(config: &VmConfig) -> Vec<String> {
+        config
+            .str("tags")
+            .map(|t| {
+                t.split([';', ',', ' '])
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn ip_of(config: &VmConfig) -> Option<Ipv4Addr> {
+        Self::tag_values(config)
+            .iter()
+            .find_map(|t| parse_ip_tag(t))
     }
 
     async fn address_for(&self, config: &VmConfig, vmid: u32) -> Result<Ipv4Addr, ReconcileError> {
-        let own = config
-            .str("tags")
-            .and_then(|t| t.split([';', ',', ' ']).find_map(parse_ip_tag));
-        if let Some(ip) = own {
+        if let Some(ip) = Self::ip_of(config) {
             return Ok(ip);
         }
         let _guard = self.allocation.lock().await;
-        let used: BTreeSet<Ipv4Addr> = self
-            .pve
-            .list_vms()
-            .await?
-            .iter()
-            .filter(|vm| vm.vmid != vmid)
-            .flat_map(|vm| {
-                vm.tag_list()
-                    .into_iter()
-                    .filter_map(parse_ip_tag)
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        // Read tags from the VM configs, not the (lagging) resource list.
+        let mut used = BTreeSet::new();
+        for other in self.managed().await?.iter().filter(|vm| vm.vmid != vmid) {
+            match self.pve.config(other.vmid).await {
+                Ok(other_config) => used.extend(Self::ip_of(&other_config)),
+                Err(PveError::NotFound | PveError::Locked) => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
         let ip = ipam::allocate(self.settings.ip_pool, &used).ok_or_else(|| {
             ReconcileError::Capacity("no free address left in the IP pool".into())
         })?;
         // Commit the address immediately so a concurrent allocation sees it.
         self.pve
-            .set_config(
-                vmid,
-                &[("tags", format!("{TAG_MARKER};{}", ipam::ip_tag(ip)))],
-            )
+            .set_config(vmid, &[("tags", Self::tags_for(ip, None))])
             .await?;
         Ok(ip)
     }
@@ -322,11 +394,12 @@ impl Reconciler {
         config: &VmConfig,
         mut meta: VmMeta,
         power: &str,
+        previous_vpc: Option<Uuid>,
     ) -> Result<(), ReconcileError> {
         let vmid = vm.vmid;
         let spec = meta.spec.clone();
         if power != "stopped" && Self::restart_needed(config, &spec) {
-            // CPU, memory and cloud-init changes apply on the next boot.
+            // CPU, memory, cloud-init and NIC changes apply on the next boot.
             self.pve.shutdown(vmid, SHUTDOWN_TIMEOUT_SECONDS).await?;
             return Ok(());
         }
@@ -337,34 +410,154 @@ impl Reconciler {
             self.pve.resize(vmid, ROOT_DISK, spec.disk_gib).await?;
         }
         meta.applied_generation = meta.generation;
-        self.pve
-            .set_config(
-                vmid,
-                &[
-                    ("cores", spec.cpu_cores.to_string()),
-                    ("sockets", "1".into()),
-                    ("memory", spec.memory_mib.to_string()),
-                    ("balloon", "0".into()),
-                    ("onboot", "1".into()),
-                    ("ciuser", spec.username.clone()),
-                    (
-                        "sshkeys",
-                        percent_encode(&format!("{}\n", Self::desired_sshkeys(&spec))),
-                    ),
-                    (
-                        "ipconfig0",
-                        format!(
-                            "ip={ip}/{},gw={}",
-                            self.settings.network_prefix, self.settings.gateway
-                        ),
-                    ),
-                    ("nameserver", self.settings.nameserver.to_string()),
-                    ("searchdomain", self.settings.search_domain.clone()),
-                    ("tags", format!("{TAG_MARKER};{}", ipam::ip_tag(ip))),
-                    ("description", Self::describe(&meta)?),
-                ],
-            )
+        let mut params = vec![
+            ("cores", spec.cpu_cores.to_string()),
+            ("sockets", "1".into()),
+            ("memory", spec.memory_mib.to_string()),
+            ("balloon", "0".into()),
+            ("onboot", "1".into()),
+            ("ciuser", spec.username.clone()),
+            (
+                "sshkeys",
+                percent_encode(&format!("{}\n", Self::desired_sshkeys(&spec))),
+            ),
+            (
+                "ipconfig0",
+                format!(
+                    "ip={ip}/{},gw={}",
+                    self.settings.network_prefix, self.settings.gateway
+                ),
+            ),
+            ("nameserver", self.settings.nameserver.to_string()),
+            ("searchdomain", self.settings.search_domain.clone()),
+            ("tags", Self::tags_for(ip, spec.network.vpc_id)),
+            ("description", Self::describe(&meta)?),
+        ];
+        if let Some(net0) = net0_with_firewall(config) {
+            params.push(("net0", net0));
+        }
+        // Firewall objects first, config last: a VM never boots unfiltered.
+        self.ensure_firewall(vmid, &spec, ip).await?;
+        self.pve.set_config(vmid, &params).await?;
+        if let Some(vpc) = spec.network.vpc_id {
+            self.sync_vpc(vpc, None).await?;
+        }
+        if let Some(old) = previous_vpc.filter(|old| Some(*old) != spec.network.vpc_id) {
+            self.sync_vpc(old, None).await?;
+        }
+        Ok(())
+    }
+
+    /// Make the VM's firewall options, IP sets and rules match the spec.
+    async fn ensure_firewall(
+        &self,
+        vmid: u32,
+        spec: &VmSpec,
+        ip: Ipv4Addr,
+    ) -> Result<(), ReconcileError> {
+        self.set_ipset(vmid, IPFILTER_IPSET, &BTreeSet::from([ip.to_string()]))
             .await?;
+        if spec.network.vpc_id.is_none() {
+            self.set_ipset(vmid, VPC_IPSET, &BTreeSet::new()).await?;
+        } else {
+            self.ensure_ipset(vmid, VPC_IPSET).await?;
+        }
+
+        let desired = firewall::rules(spec, self.settings.nameserver);
+        let current = self.pve.fw_rules(vmid).await?;
+        let in_sync = current.len() == desired.len()
+            && desired
+                .iter()
+                .zip(&current)
+                .all(|(want, have)| want.matches(have));
+        if !in_sync {
+            let mut positions: Vec<u64> = current
+                .iter()
+                .filter_map(|r| r.get("pos").and_then(Value::as_u64))
+                .collect();
+            positions.sort_unstable_by(|a, b| b.cmp(a));
+            for pos in positions {
+                self.pve.delete_fw_rule(vmid, pos).await?;
+            }
+            // Proxmox inserts every new rule at the top, so add them last to first.
+            for rule in desired.iter().rev() {
+                self.pve.add_fw_rule(vmid, &rule.params()).await?;
+            }
+        }
+
+        let options = self.pve.fw_options(vmid).await?;
+        let changed: Vec<(&str, String)> = firewall::OPTIONS
+            .iter()
+            .filter(|(key, want)| options.str(key).as_deref() != Some(*want))
+            .map(|(key, want)| (*key, (*want).to_owned()))
+            .collect();
+        if !changed.is_empty() {
+            self.pve.set_fw_options(vmid, &changed).await?;
+        }
+        Ok(())
+    }
+
+    async fn ensure_ipset(&self, vmid: u32, name: &str) -> Result<(), ReconcileError> {
+        if !self.pve.fw_ipsets(vmid).await?.iter().any(|n| n == name) {
+            self.pve.create_fw_ipset(vmid, name).await?;
+        }
+        Ok(())
+    }
+
+    /// Replace the entries of a VM-scoped IP set.
+    async fn set_ipset(
+        &self,
+        vmid: u32,
+        name: &str,
+        desired: &BTreeSet<String>,
+    ) -> Result<(), ReconcileError> {
+        self.ensure_ipset(vmid, name).await?;
+        let current: BTreeSet<String> = self
+            .pve
+            .fw_ipset_entries(vmid, name)
+            .await?
+            .into_iter()
+            .map(|c| c.strip_suffix("/32").unwrap_or(&c).to_owned())
+            .collect();
+        for stale in current.difference(desired) {
+            self.pve.delete_fw_ipset_entry(vmid, name, stale).await?;
+        }
+        for missing in desired.difference(&current) {
+            self.pve.add_fw_ipset_entry(vmid, name, missing).await?;
+        }
+        Ok(())
+    }
+
+    /// Give every VM of a VPC the addresses of all the others. `exclude` is a VM
+    /// that is leaving (being deleted).
+    async fn sync_vpc(&self, vpc: Uuid, exclude: Option<u32>) -> Result<(), ReconcileError> {
+        let tag = vpc_tag(vpc);
+        let mut members: Vec<(u32, Ipv4Addr)> = Vec::new();
+        for vm in self
+            .managed()
+            .await?
+            .iter()
+            .filter(|vm| Some(vm.vmid) != exclude)
+        {
+            let config = match self.pve.config(vm.vmid).await {
+                Ok(config) => config,
+                Err(PveError::NotFound | PveError::Locked) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            if Self::tag_values(&config).contains(&tag)
+                && let Some(ip) = Self::ip_of(&config)
+            {
+                members.push((vm.vmid, ip));
+            }
+        }
+        for (vmid, own) in &members {
+            let peers: BTreeSet<String> = members
+                .iter()
+                .filter(|(_, ip)| ip != own)
+                .map(|(_, ip)| ip.to_string())
+                .collect();
+            self.set_ipset(*vmid, VPC_IPSET, &peers).await?;
+        }
         Ok(())
     }
 
@@ -376,6 +569,10 @@ impl Reconciler {
         meta: &VmMeta,
         power: &str,
     ) -> Result<Value, ReconcileError> {
+        if let Some(ip) = Self::ip_of(config) {
+            // Cheap, idempotent, and heals manual edits of the firewall.
+            self.ensure_firewall(vm.vmid, &meta.spec, ip).await?;
+        }
         match (power, meta.spec.stopped) {
             ("running", false) | ("stopped", true) => {
                 Ok(Self::status_json(vm, config, meta, power))
@@ -393,22 +590,21 @@ impl Reconciler {
     }
 
     fn status_json(vm: &PveVm, config: &VmConfig, meta: &VmMeta, power: &str) -> Value {
-        let ip = config
-            .str("tags")
-            .and_then(|t| t.split([';', ',', ' ']).find_map(parse_ip_tag));
         json!({
             "phase": "ready",
             "observed_generation": meta.applied_generation,
             "vmid": vm.vmid,
             "node": vm.node,
             "hostname": vm.name,
-            "ip_address": ip.map(|ip| ip.to_string()),
+            "ip_address": Self::ip_of(config).map(|ip| ip.to_string()),
             "power_state": power,
             "image": meta.spec.image,
             "cpu_cores": meta.spec.cpu_cores,
             "memory_mib": meta.spec.memory_mib,
             "disk_gib": meta.spec.disk_gib,
             "username": meta.spec.username,
+            "vpc_id": meta.spec.network.vpc_id,
+            "firewall": "enforced",
         })
     }
 
@@ -430,6 +626,10 @@ impl Reconciler {
             Self::check_identity(&meta, claims)?;
             if generation < meta.generation {
                 return Err(ReconcileError::Conflict("generation is stale".into()));
+            }
+            if let Some(vpc) = meta.spec.network.vpc_id {
+                // Peers stop allowing this address before the VM goes away.
+                self.sync_vpc(vpc, Some(vm.vmid)).await?;
             }
         }
         if self.pve.power_state(vm.vmid).await? != "stopped" {
@@ -463,6 +663,26 @@ impl Reconciler {
         let power = self.pve.power_state(vm.vmid).await?;
         Ok(Self::status_json(&vm, &config, &meta, &power))
     }
+}
+
+fn vpc_tag(vpc: Uuid) -> String {
+    format!("hc-vpc-{}", vpc.simple())
+}
+
+fn has_firewall_flag(config: &VmConfig) -> bool {
+    config
+        .str("net0")
+        .is_some_and(|n| n.split(',').any(|part| part == "firewall=1"))
+}
+
+/// `net0` with `firewall=1`, or `None` if it is already set.
+fn net0_with_firewall(config: &VmConfig) -> Option<String> {
+    let net0 = config.str("net0")?;
+    if has_firewall_flag(config) {
+        return None;
+    }
+    let parts: Vec<&str> = net0.split(',').filter(|p| *p != "firewall=0").collect();
+    Some(format!("{},firewall=1", parts.join(",")))
 }
 
 fn percent_decode(value: &str) -> String {

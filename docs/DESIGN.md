@@ -83,6 +83,45 @@ cloud-init. Two lessons from the lab:
 * `cicustom` can only be set by `root@pam`, so the provider never uses it; the
   guest agent is baked into the template instead (`scripts/make-template.sh`).
 
+## Firewall
+
+Every VM runs behind its own Proxmox firewall (`net0` has `firewall=1`) with
+`policy_in = policy_out = DROP`, `ipfilter` (the VM may only use its assigned
+address) and `macfilter`. Nothing is shared at datacenter level, so the provider
+needs only `VM.Config.Network` on the VM. The firewall objects exist before the
+VM first boots.
+
+The spec's `network` section opens it up:
+
+```json
+"network": {
+  "vpc_id": "…uuid…",
+  "ingress": [{"protocol": "tcp", "ports": "22", "source_cidrs": ["10.0.128.0/24"]}],
+  "egress": {"mode": "internet", "denied_destination_cidrs": [], "allowed_destination_cidrs": []}
+}
+```
+
+| Part | Meaning |
+| --- | --- |
+| `vpc_id` | VMs with the same id reach each other in both directions. Tadokoro keeps a VM-scoped IP set `vpc` on every member (the other members' addresses) and tags VMs `hc-vpc-<id>`. |
+| `ingress[]` | Allow `tcp`/`udp` (`ports` = `22` or `8000-8100`) or `icmp` from the listed IPv4 CIDRs. Default: none. |
+| `egress.mode` | `internet` (default) drops the private ranges (`10/8`, `172.16/12`, `192.168/16`, `100.64/10`, …) and allows the rest; `restricted` allows only `allowed_destination_cidrs`; `disabled` allows nothing. `denied_destination_cidrs` always wins. |
+
+Name resolution to the provider's nameserver (UDP/TCP 53) is always allowed.
+`allowed_destination_cidrs` may not overlap the private ranges, the same rule Flash
+uses, so a tenant cannot open a path to infrastructure or to other tenants; they
+only meet inside a shared VPC. Replies need no rule (conntrack).
+
+Rules are derived from the spec (`src/firewall.rs`) and rewritten as a whole when
+they differ, with the comment `tadokoro` on each. They are checked on every
+`PUT`, so manual edits are healed, and a VM that predates the firewall is moved
+under it (one restart to attach the filtered NIC). On delete the VM is removed from
+its peers' IP sets before it is stopped.
+
+One-time host setup: `scripts/pve-firewall-setup.sh` enables the datacenter
+firewall with host policies left at `ACCEPT`, so SSH, the web UI and the corosync
+link are never cut off.
+
 ## Proxmox permissions
 
 `scripts/pve-setup.sh` creates the role `HCTadokoro`, user `tadokoro@pve` and an
@@ -95,6 +134,5 @@ token secret is mounted from a Kubernetes Secret and never logged.
 * HeteroCloud core support for a `vm` service kind (domain spec, store, worker
   dispatch, IAM actions `vm:*`, CLI and console). Until then the provider is driven
   by signed `provider/v1` requests directly.
-* Per-VPC isolation with the Proxmox firewall (IPSet and security group per VPC,
-  default deny, `ipfilter`) and Flash VIP integration.
+* Flash VIP integration (letting VPC VMs reach Flash services).
 * Console access (noVNC/serial), snapshots, and extra disks.

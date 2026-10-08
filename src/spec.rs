@@ -1,10 +1,12 @@
 //! The strict VM specification HeteroCloud forwards unchanged to this provider.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, net::Ipv4Addr};
 
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
+use uuid::Uuid;
 
 pub const MAX_NAME_BYTES: usize = 120;
 
@@ -25,7 +27,88 @@ pub struct VmSpec {
     #[serde(default)]
     pub stopped: bool,
     #[serde(default)]
+    pub network: VmNetwork,
+    #[serde(default)]
     pub metadata: BTreeMap<String, Value>,
+}
+
+pub const MAX_INGRESS_RULES: usize = 32;
+pub const MAX_SOURCE_CIDRS: usize = 16;
+pub const MAX_DESTINATION_CIDRS: usize = 32;
+
+/// Every VM runs behind a default-deny Proxmox firewall; this opens it up.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct VmNetwork {
+    /// VMs with the same VPC id may talk to each other in both directions.
+    #[serde(default)]
+    pub vpc_id: Option<Uuid>,
+    #[serde(default)]
+    pub ingress: Vec<IngressRule>,
+    #[serde(default)]
+    pub egress: Egress,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Protocol {
+    Tcp,
+    Udp,
+    Icmp,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct IngressRule {
+    pub protocol: Protocol,
+    /// `22` or `8000-8100`; required for tcp/udp and not allowed for icmp.
+    #[serde(default)]
+    pub ports: Option<String>,
+    pub source_cidrs: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EgressMode {
+    Disabled,
+    Restricted,
+    #[default]
+    Internet,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct Egress {
+    #[serde(default)]
+    pub mode: EgressMode,
+    /// Only with `restricted`; may not overlap the private ranges below.
+    #[serde(default)]
+    pub allowed_destination_cidrs: Vec<String>,
+    #[serde(default)]
+    pub denied_destination_cidrs: Vec<String>,
+}
+
+/// Always blocked towards the internet; infrastructure and other tenants live here.
+pub const PROTECTED_NETWORKS: [&str; 8] = [
+    "0.0.0.0/8",
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "224.0.0.0/3",
+];
+
+/// Parses an IPv4 address or CIDR (a bare address is a /32).
+pub fn parse_cidr(value: &str) -> Option<Ipv4Net> {
+    if value.is_empty() || value.trim() != value {
+        return None;
+    }
+    value
+        .parse::<Ipv4Net>()
+        .ok()
+        .or_else(|| value.parse::<Ipv4Addr>().ok().map(Ipv4Net::from))
 }
 
 fn default_username() -> String {
@@ -66,6 +149,7 @@ impl VmSpec {
             validate_ssh_key(key)?;
         }
         validate_username(&self.username)?;
+        self.network.validate()?;
         let metadata = serde_json::to_vec(&self.metadata)
             .map_err(|_| SpecError::Invalid("metadata is not serializable".into()))?;
         if metadata.len() > 64 * 1024 {
@@ -73,6 +157,88 @@ impl VmSpec {
         }
         Ok(())
     }
+}
+
+impl VmNetwork {
+    pub fn validate(&self) -> Result<(), SpecError> {
+        if self.ingress.len() > MAX_INGRESS_RULES {
+            return invalid(format!(
+                "at most {MAX_INGRESS_RULES} ingress rules are allowed"
+            ));
+        }
+        for rule in &self.ingress {
+            rule.validate()?;
+        }
+        let egress = &self.egress;
+        let allowed = parse_cidrs(
+            "allowed_destination_cidrs",
+            &egress.allowed_destination_cidrs,
+            MAX_DESTINATION_CIDRS,
+        )?;
+        parse_cidrs(
+            "denied_destination_cidrs",
+            &egress.denied_destination_cidrs,
+            MAX_DESTINATION_CIDRS,
+        )?;
+        if egress.mode != EgressMode::Restricted && !allowed.is_empty() {
+            return invalid("allowed_destination_cidrs requires restricted egress mode");
+        }
+        for network in &allowed {
+            let overlaps = PROTECTED_NETWORKS
+                .iter()
+                .filter_map(|p| p.parse::<Ipv4Net>().ok())
+                .any(|p| p.contains(network) || network.contains(&p));
+            if overlaps {
+                return invalid(format!(
+                    "allowed destination {network} overlaps a protected private or infrastructure network"
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl IngressRule {
+    fn validate(&self) -> Result<(), SpecError> {
+        match (self.protocol, &self.ports) {
+            (Protocol::Icmp, None) => {}
+            (Protocol::Icmp, Some(_)) => return invalid("icmp ingress rules cannot have ports"),
+            (_, None) => return invalid("tcp and udp ingress rules require ports"),
+            (_, Some(ports)) => {
+                port_range(ports).ok_or_else(|| {
+                    SpecError::Invalid("ports must be a port or a range such as 8000-8100".into())
+                })?;
+            }
+        }
+        if self.source_cidrs.is_empty() {
+            return invalid("ingress rules require at least one source CIDR");
+        }
+        parse_cidrs("source_cidrs", &self.source_cidrs, MAX_SOURCE_CIDRS).map(|_| ())
+    }
+}
+
+/// `22` -> (22, 22); `8000-8100` -> (8000, 8100).
+pub fn port_range(value: &str) -> Option<(u16, u16)> {
+    let (start, end) = match value.split_once('-') {
+        Some((a, b)) => (a, b),
+        None => (value, value),
+    };
+    let (start, end): (u16, u16) = (start.parse().ok()?, end.parse().ok()?);
+    (start >= 1 && start <= end).then_some((start, end))
+}
+
+fn parse_cidrs(field: &str, values: &[String], maximum: usize) -> Result<Vec<Ipv4Net>, SpecError> {
+    if values.len() > maximum {
+        return invalid(format!("{field} must contain at most {maximum} entries"));
+    }
+    values
+        .iter()
+        .map(|v| {
+            parse_cidr(v).ok_or_else(|| {
+                SpecError::Invalid(format!("{field} entries must be IPv4 addresses or CIDRs"))
+            })
+        })
+        .collect()
 }
 
 fn validate_username(value: &str) -> Result<(), SpecError> {
