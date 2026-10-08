@@ -833,6 +833,41 @@ impl Reconciler {
         Err(ReconcileError::NotReady)
     }
 
+    /// Verifies the caller may open a shell on this VM and returns its VMID: same tenant,
+    /// current generation, configured and running.
+    pub async fn shell_target(
+        &self,
+        claims: &ProviderClaims,
+        generation: i64,
+    ) -> Result<u32, ReconcileError> {
+        let vm = self
+            .find(claims.service_instance_id)
+            .await?
+            .ok_or(ReconcileError::NotFound)?;
+        let config = self.locked_config(vm.vmid).await?;
+        let meta = Self::meta_of(&config).ok_or(ReconcileError::NotReady)?;
+        Self::check_identity(&meta, claims)?;
+        if meta.generation != generation {
+            return Err(ReconcileError::Conflict(
+                "generation does not match current desired state".into(),
+            ));
+        }
+        if meta.applied_generation < generation || self.pve.power_state(vm.vmid).await? != "running"
+        {
+            return Err(ReconcileError::NotReady);
+        }
+        Ok(vm.vmid)
+    }
+
+    pub async fn open_terminal(
+        &self,
+        vmid: u32,
+    ) -> Result<(crate::pve::TerminalSocket, crate::pve::TermProxy), ReconcileError> {
+        let proxy = self.pve.termproxy(vmid).await?;
+        let socket = self.pve.connect_terminal(vmid, &proxy).await?;
+        Ok((socket, proxy))
+    }
+
     pub async fn status(
         &self,
         claims: &ProviderClaims,

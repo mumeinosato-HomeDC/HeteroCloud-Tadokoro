@@ -12,7 +12,7 @@ user=tadokoro@pve
 token=provider
 role=HCTadokoro
 
-pveum role add "$role" --privs "VM.Allocate VM.Clone VM.Audit VM.PowerMgmt VM.Config.CPU VM.Config.Memory VM.Config.Disk VM.Config.Network VM.Config.Cloudinit VM.Config.Options VM.Config.HWType VM.GuestAgent.Audit Datastore.AllocateSpace Datastore.Audit SDN.Use Sys.Audit" 2>/dev/null \
+pveum role add "$role" --privs "VM.Allocate VM.Clone VM.Audit VM.Console VM.Console VM.PowerMgmt VM.Config.CPU VM.Config.Memory VM.Config.Disk VM.Config.Network VM.Config.Cloudinit VM.Config.Options VM.Config.HWType VM.GuestAgent.Audit Datastore.AllocateSpace Datastore.Audit SDN.Use Sys.Audit" 2>/dev/null \
   || echo "role $role already exists"
 pveum user add "$user" --comment "HeteroCloud Tadokoro VM provider" 2>/dev/null || echo "user $user already exists"
 pveum acl modify /vms --users "$user" --roles "$role"

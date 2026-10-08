@@ -30,7 +30,17 @@ cat >"$snippets/tadokoro-vendor.yaml" <<'YAML'
 #cloud-config
 package_update: true
 packages: [qemu-guest-agent]
-runcmd: [systemctl enable --now qemu-guest-agent]
+write_files:
+  # The web shell attaches to the serial console; access is already gated by HeteroCloud IAM,
+  # so the console logs in as the default user instead of asking for a password nobody has.
+  - path: /etc/systemd/system/serial-getty@ttyS0.service.d/autologin.conf
+    content: |
+      [Service]
+      ExecStart=
+      ExecStart=-/sbin/agetty --autologin ubuntu --noclear --keep-baud 115200,57600,38400,9600 %I $TERM
+runcmd:
+  - systemctl enable --now qemu-guest-agent
+  - systemctl restart serial-getty@ttyS0.service
 YAML
 
 # mtu=1 follows the bridge MTU; the VXLAN underlay is smaller than 1500.

@@ -203,3 +203,11 @@ token secret is mounted from a Kubernetes Secret and never logged.
   by signed `provider/v1` requests directly.
 * Per-VPC source addresses for Flash → VM traffic (see the limitation above).
 * Console access (noVNC/serial), snapshots, and extra disks.
+
+## Web shell
+
+`GET /internal/v1/service-instances/{id}/shell` (action `vm.shell`, WebSocket) relays a browser terminal to the VM's
+serial console through Proxmox `termproxy` + `vncwebsocket`. Binary frames are keystrokes, `{"type":"resize"}` text
+frames resize the pty; output comes back as binary frames. Requires a running, applied VM and the `VM.Console`
+privilege on the Tadokoro role. Concurrent sessions are capped (16). The template's `serial-getty@ttyS0` auto-logs in
+as the default user because access is already authorized by HeteroCloud IAM (`vm:ExecInstance`).
