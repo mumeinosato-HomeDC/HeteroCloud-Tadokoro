@@ -74,6 +74,17 @@ pub struct Config {
         default_value = "hetero.internal"
     )]
     pub search_domain: String,
+    /// Namespace with the Flash workloads. When set, Tadokoro reads the VM-facing
+    /// virtual IPs that the VPC provider publishes there (needs a read-only Role).
+    #[arg(long, env = "TADOKORO_FLASH_NAMESPACE")]
+    pub flash_namespace: Option<String>,
+    /// Source addresses Flash traffic to VMs arrives from (the node address that
+    /// pod traffic is translated to). Comma separated.
+    #[arg(long, env = "TADOKORO_FLASH_SNAT_ADDRESSES", value_delimiter = ',')]
+    pub flash_snat_addresses: Vec<Ipv4Addr>,
+    /// How often VPC membership and Flash addresses are re-synchronised.
+    #[arg(long, env = "TADOKORO_VPC_SYNC_SECONDS", default_value_t = 30)]
+    pub vpc_sync_seconds: u64,
     /// Upper bound of VMs this provider keeps at once.
     #[arg(long, env = "TADOKORO_MAX_VMS", default_value_t = 32)]
     pub max_vms: usize,

@@ -13,7 +13,12 @@ spec:
     metadata:
       labels: {{- include "tadokoro.selector" . | nindent 8 }}
     spec:
+      {{- if .Values.flash.enabled }}
+      serviceAccountName: {{ include "tadokoro.name" . }}
+      automountServiceAccountToken: true
+      {{- else }}
       automountServiceAccountToken: false
+      {{- end }}
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -47,6 +52,11 @@ spec:
             - { name: TADOKORO_NAMESERVER, value: {{ .Values.vm.nameserver | quote }} }
             - { name: TADOKORO_SEARCH_DOMAIN, value: {{ .Values.vm.searchDomain | quote }} }
             - { name: TADOKORO_MAX_VMS, value: {{ .Values.vm.maxVms | quote }} }
+            {{- if .Values.flash.enabled }}
+            - { name: TADOKORO_FLASH_NAMESPACE, value: {{ .Values.flash.namespace | quote }} }
+            - { name: TADOKORO_FLASH_SNAT_ADDRESSES, value: {{ join "," .Values.flash.snatAddresses | quote }} }
+            - { name: TADOKORO_VPC_SYNC_SECONDS, value: {{ .Values.flash.syncSeconds | quote }} }
+            {{- end }}
           ports:
             - { name: http, containerPort: 8080 }
           readinessProbe:

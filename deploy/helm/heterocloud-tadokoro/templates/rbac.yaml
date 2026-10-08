@@ -1,0 +1,34 @@
+{{- if .Values.flash.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "tadokoro.name" . }}
+  labels: {{- include "tadokoro.labels" . | nindent 4 }}
+---
+# Read-only: Tadokoro only needs the VM-facing virtual IPs of Flash services.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "tadokoro.name" . }}-flash-addresses
+  namespace: {{ .Values.flash.namespace }}
+  labels: {{- include "tadokoro.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [services]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "tadokoro.name" . }}-flash-addresses
+  namespace: {{ .Values.flash.namespace }}
+  labels: {{- include "tadokoro.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "tadokoro.name" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "tadokoro.name" . }}-flash-addresses
+{{- end }}
