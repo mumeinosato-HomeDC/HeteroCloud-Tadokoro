@@ -460,6 +460,12 @@ async fn firewall_is_enforced_before_the_vm_starts() {
     assert_eq!(vm.fw_rules[0]["type"], "in");
     assert_eq!(vm.fw_rules[0]["dport"], "22");
     assert_eq!(vm.fw_rules[0]["source"], "10.0.128.0/24");
+    // First match wins: the catch-all accept must come after the private-range drop.
+    let last = vm.fw_rules.last().expect("rules");
+    assert_eq!(last["type"], "out");
+    assert_eq!(last["action"], "ACCEPT");
+    assert!(!last.contains_key("dest"));
+    assert_eq!(vm.fw_rules[vm.fw_rules.len() - 2]["action"], "DROP");
     assert!(vm.fw_rules.iter().all(|r| r["comment"] == "tadokoro"));
     let log = calls(&h);
     let options = log

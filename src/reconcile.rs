@@ -479,7 +479,8 @@ impl Reconciler {
             for pos in positions {
                 self.pve.delete_fw_rule(vmid, pos).await?;
             }
-            for rule in &desired {
+            // Proxmox inserts every new rule at the top, so add them last to first.
+            for rule in desired.iter().rev() {
                 self.pve.add_fw_rule(vmid, &rule.params()).await?;
             }
         }

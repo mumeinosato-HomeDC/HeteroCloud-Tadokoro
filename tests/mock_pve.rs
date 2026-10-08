@@ -421,7 +421,8 @@ async fn add_fw_rule(
     }
     let mut s = s.lock().unwrap();
     let vm = vm_or_missing!(s, vmid);
-    vm.fw_rules.push(form.into_iter().collect());
+    // Like Proxmox: a new rule goes to the top of the list.
+    vm.fw_rules.insert(0, form.into_iter().collect());
     s.calls.push(format!("fw-rule-add {vmid}"));
     Json(json!({"data": null})).into_response()
 }
