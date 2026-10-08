@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tadokoro.name" . }}
+  labels: {{- include "tadokoro.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: {{- include "tadokoro.selector" . | nindent 6 }}
+  template:
+    metadata:
+      labels: {{- include "tadokoro.selector" . | nindent 8 }}
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: tadokoro
+          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: TADOKORO_BIND_ADDR, value: "0.0.0.0:8080" }
+            - { name: HETEROCLOUD_PROVIDER_ISSUER, value: {{ .Values.providerAuth.issuer | quote }} }
+            - { name: HETEROCLOUD_PROVIDER_AUDIENCE, value: {{ .Values.providerAuth.audience | quote }} }
+            - name: HETEROCLOUD_PROVIDER_PUBLIC_KEYS_JSON
+              value: {{ required "providerAuth.publicKeysJson is required" .Values.providerAuth.publicKeysJson | quote }}
+            - { name: TADOKORO_PVE_URL, value: {{ required "pve.url is required" .Values.pve.url | quote }} }
+            - { name: TADOKORO_PVE_NODE, value: {{ .Values.pve.node | quote }} }
+            - { name: TADOKORO_PVE_TOKEN_ID, value: {{ .Values.pve.tokenId | quote }} }
+            - { name: TADOKORO_PVE_TOKEN_SECRET_FILE, value: /var/run/secrets/pve/token-secret }
+            {{- if .Values.pve.caConfigMapName }}
+            - { name: TADOKORO_PVE_CA_FILE, value: /var/run/secrets/pve-ca/ca.crt }
+            {{- end }}
+            - { name: TADOKORO_PVE_STORAGE, value: {{ .Values.pve.storage | quote }} }
+            - { name: TADOKORO_REGION, value: {{ .Values.vm.region | quote }} }
+            - { name: TADOKORO_IMAGES_JSON, value: {{ .Values.vm.images | toJson | quote }} }
+            - { name: TADOKORO_BRIDGE, value: {{ .Values.vm.bridge | quote }} }
+            - { name: TADOKORO_IP_POOL, value: {{ .Values.vm.ipPool | quote }} }
+            - { name: TADOKORO_NETWORK_PREFIX, value: {{ .Values.vm.networkPrefix | quote }} }
+            - { name: TADOKORO_GATEWAY, value: {{ .Values.vm.gateway | quote }} }
+            - { name: TADOKORO_NAMESERVER, value: {{ .Values.vm.nameserver | quote }} }
+            - { name: TADOKORO_SEARCH_DOMAIN, value: {{ .Values.vm.searchDomain | quote }} }
+            - { name: TADOKORO_MAX_VMS, value: {{ .Values.vm.maxVms | quote }} }
+          ports:
+            - { name: http, containerPort: 8080 }
+          readinessProbe:
+            httpGet: { path: /health/ready, port: http }
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health/live, port: http }
+            periodSeconds: 10
+          resources: {{- toYaml .Values.resources | nindent 12 }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: [ALL] }
+          volumeMounts:
+            - { name: pve, mountPath: /var/run/secrets/pve, readOnly: true }
+            {{- if .Values.pve.caConfigMapName }}
+            - { name: pve-ca, mountPath: /var/run/secrets/pve-ca, readOnly: true }
+            {{- end }}
+      volumes:
+        - name: pve
+          secret: { secretName: {{ .Values.pve.tokenSecretName | quote }}, defaultMode: 0440 }
+        {{- if .Values.pve.caConfigMapName }}
+        - name: pve-ca
+          configMap: { name: {{ .Values.pve.caConfigMapName | quote }} }
+        {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}

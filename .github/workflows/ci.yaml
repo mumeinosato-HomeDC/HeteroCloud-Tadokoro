@@ -1,0 +1,24 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [dev, main]
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.1
+        with:
+          components: clippy, rustfmt
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+  helm:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+      - run: |
+          helm lint deploy/helm/heterocloud-tadokoro \
+            --set providerAuth.publicKeysJson='{"k":"x"}' --set pve.url=https://pve.example:8006
