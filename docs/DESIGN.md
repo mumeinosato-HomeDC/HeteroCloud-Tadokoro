@@ -122,6 +122,31 @@ One-time host setup: `scripts/pve-firewall-setup.sh` enables the datacenter
 firewall with host policies left at `ACCEPT`, so SSH, the web UI and the corosync
 link are never cut off.
 
+## Flash services in the same VPC
+
+VMs and Flash containers that share a `vpc_id` can talk to each other once the VPC has
+`vm_access: true` (set on the VPC in HeteroCloud; the VPC provider does the Flash side).
+
+```
+VM  ──▶  virtual IP (MetalLB pool "vpc", 10.100.3.0/24, ARP on ens19)  ──▶  Flash pod
+VM  ◀──  Flash pod (source NATed to the node address 10.100.0.10)
+```
+
+* **VM → Flash.** The VPC provider publishes a `LoadBalancer` Service per member
+  (`externalTrafficPolicy: Local`, so the VM's address survives). Tadokoro reads those Services
+  with a read-only Role in the Flash namespace and keeps their addresses in the VM-scoped IP set
+  `flash-vip`; the VM may send to exactly those. The addresses come and go with Flash services, so
+  a periodic sync (`TADOKORO_VPC_SYNC_SECONDS`) follows them and also rolls rule changes out to settled VMs.
+* **Flash → VM.** Pod traffic leaves the node translated to its address on the VM network
+  (`TADOKORO_FLASH_SNAT_ADDRESSES`, an IP set `flash-src`); VMs of the VPC accept it.
+* A VM outside the VPC has neither set and no rule that refers to them; Flash pods of the VPC
+  cannot reach it, and it cannot reach the VPC's virtual IPs (verified).
+
+**Limitation.** Because all pods share one translated source address, two VPCs that both enable
+`vm_access` are not isolated from each other on the Flash → VM direction: a pod of VPC A could reach a
+VM of VPC B. The VM → Flash direction is exact (one virtual IP per service, one firewall per VM). Closing the
+gap needs a per-VPC egress address (the VPC provider's EgressGateway with a dedicated EIP per VPC).
+
 ## Proxmox permissions
 
 `scripts/pve-setup.sh` creates the role `HCTadokoro`, user `tadokoro@pve` and an
@@ -134,5 +159,5 @@ token secret is mounted from a Kubernetes Secret and never logged.
 * HeteroCloud core support for a `vm` service kind (domain spec, store, worker
   dispatch, IAM actions `vm:*`, CLI and console). Until then the provider is driven
   by signed `provider/v1` requests directly.
-* Flash VIP integration (letting VPC VMs reach Flash services).
+* Per-VPC source addresses for Flash → VM traffic (see the limitation above).
 * Console access (noVNC/serial), snapshots, and extra disks.
