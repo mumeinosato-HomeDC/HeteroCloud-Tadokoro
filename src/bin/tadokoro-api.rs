@@ -106,6 +106,7 @@ async fn run() -> Result<()> {
         authenticator,
         reconciler,
         region: config.region.clone(),
+        shell_sessions: Arc::new(tokio::sync::Semaphore::new(16)),
     });
     let listener = TcpListener::bind(&config.bind_addr)
         .await

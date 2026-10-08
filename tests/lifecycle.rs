@@ -109,6 +109,7 @@ async fn harness(max_vms: usize) -> Harness {
         authenticator,
         reconciler: reconciler.clone(),
         region: "heteronet-global".into(),
+        shell_sessions: Arc::new(tokio::sync::Semaphore::new(4)),
     }));
     Harness {
         app,

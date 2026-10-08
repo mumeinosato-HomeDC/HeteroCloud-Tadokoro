@@ -8,6 +8,7 @@ use std::{
 
 use axum::{
     Form, Json, Router,
+    extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -136,6 +137,14 @@ pub fn router(state: Shared) -> Router {
         .route(
             "/api2/json/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}/{cidr}",
             axum::routing::delete(delete_ipset_entry),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/termproxy",
+            post(termproxy),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket",
+            get(vncwebsocket),
         )
         .with_state(state)
 }
@@ -523,4 +532,71 @@ async fn delete_ipset_entry(
         entries.retain(|c| c != &cidr);
     }
     Json(json!({"data": null})).into_response()
+}
+
+pub const TERM_USER: &str = "tadokoro@pve!provider";
+pub const TERM_TICKET: &str = "PVEVNC:5F000000::mock+ticket/with=odd+chars";
+
+async fn termproxy(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let Some(vm) = s.vms.get(&vmid) else {
+        return missing(vmid);
+    };
+    if vm.status != "running" {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "VM is not running");
+    }
+    s.calls.push(format!("termproxy {vmid}"));
+    Json(json!({"data": {"port": "5900", "ticket": TERM_TICKET, "user": TERM_USER, "upid": "UPID:termproxy"}})).into_response()
+}
+
+/// Speaks the termproxy protocol: auth line, "OK", then echoes input as output.
+async fn vncwebsocket(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    Query(q): Query<HashMap<String, String>>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    if q.get("port").map(String::as_str) != Some("5900")
+        || q.get("vncticket").map(String::as_str) != Some(TERM_TICKET)
+    {
+        return err(StatusCode::FORBIDDEN, "bad ticket");
+    }
+    upgrade.on_upgrade(move |mut socket: WebSocket| async move {
+        let Some(Ok(WsMessage::Text(auth))) = socket.recv().await else {
+            return;
+        };
+        if auth.as_str() != format!("{TERM_USER}:{TERM_TICKET}\n") {
+            return;
+        }
+        let _ = socket.send(WsMessage::Text("OK".into())).await;
+        while let Some(Ok(message)) = socket.recv().await {
+            let WsMessage::Text(text) = message else {
+                continue;
+            };
+            let text = text.as_str();
+            if let Some(rest) = text.strip_prefix("0:") {
+                let (len, data) = rest.split_once(':').unwrap_or(("0", ""));
+                assert_eq!(len.parse::<usize>().unwrap(), data.len());
+                let _ = socket
+                    .send(WsMessage::Text(format!("echo:{data}").into()))
+                    .await;
+            } else if let Some(rest) = text.strip_prefix("1:") {
+                s.lock().unwrap().calls.push(format!(
+                    "resize {vmid} {}",
+                    rest.trim_end_matches(':').replace(':', "x")
+                ));
+            }
+        }
+    })
 }

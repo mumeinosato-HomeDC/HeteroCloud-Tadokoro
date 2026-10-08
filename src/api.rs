@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, ws::WebSocketUpgrade},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, put},
@@ -14,7 +14,8 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    PROVIDER_DELETE_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION,
+    PROVIDER_DELETE_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_SHELL_ACTION,
+    PROVIDER_STATUS_GET_ACTION,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     pve::PveError,
     reconcile::{ReconcileError, Reconciler},
@@ -25,10 +26,16 @@ pub struct AppState {
     pub authenticator: ProviderAuthenticator,
     pub reconciler: Arc<Reconciler>,
     pub region: String,
+    /// Bounds the number of open shells.
+    pub shell_sessions: Arc<tokio::sync::Semaphore>,
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        .route(
+            "/internal/v1/service-instances/{service_instance_id}/shell",
+            get(shell),
+        )
         .route("/health/live", get(live))
         .route("/health/ready", get(ready))
         .route(
@@ -152,6 +159,33 @@ async fn remove(
     ))
 }
 
+async fn shell(
+    State(state): State<Arc<AppState>>,
+    Path(service_instance_id): Path<Uuid>,
+    Query(query): Query<GenerationQuery>,
+    headers: HeaderMap,
+    upgrade: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    let claims = state
+        .authenticator
+        .authenticate(&headers, PROVIDER_SHELL_ACTION)?;
+    validate_command(&claims, service_instance_id, query.generation)?;
+    let permit = Arc::clone(&state.shell_sessions)
+        .try_acquire_owned()
+        .map_err(|_| ApiError::TooManySessions)?;
+    let vmid = state
+        .reconciler
+        .shell_target(&claims, query.generation)
+        .await?;
+    let (pve_socket, proxy) = state.reconciler.open_terminal(vmid).await?;
+    Ok(upgrade
+        .max_message_size(64 * 1024)
+        .on_upgrade(move |browser| async move {
+            crate::shell::bridge(browser, pve_socket, proxy).await;
+            drop(permit);
+        }))
+}
+
 async fn get_status(
     State(state): State<Arc<AppState>>,
     Path(service_instance_id): Path<Uuid>,
@@ -183,6 +217,8 @@ pub enum ApiError {
     Capacity(String),
     #[error("virtualization backend is unavailable")]
     Unavailable,
+    #[error("too many open shells")]
+    TooManySessions,
     #[error("internal provider error")]
     Internal,
     #[error(transparent)]
@@ -226,6 +262,7 @@ impl IntoResponse for ApiError {
                 (StatusCode::UNAUTHORIZED, "missing_credentials")
             }
             Self::Auth(_) => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
+            Self::TooManySessions => (StatusCode::TOO_MANY_REQUESTS, "shell_limit_reached"),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
         let mut response = (
