@@ -9,6 +9,7 @@ pub mod api;
 pub mod auth;
 pub mod config;
 pub mod firewall;
+pub mod flash;
 pub mod ipam;
 pub mod pve;
 pub mod reconcile;

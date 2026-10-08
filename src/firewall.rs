@@ -15,6 +15,11 @@ use crate::spec::{EgressMode, PROTECTED_NETWORKS, Protocol, VmSpec, parse_cidr};
 pub const COMMENT: &str = "tadokoro";
 /// VM-scoped IP set with the addresses of the other VMs in the same VPC.
 pub const VPC_IPSET: &str = "vpc";
+/// Addresses Flash traffic into the VPC arrives from (pod traffic is translated to a node address).
+pub const FLASH_SRC_IPSET: &str = "flash-src";
+/// Virtual IPs of the VPC's Flash services, which the VM may send to.
+pub const FLASH_VIP_IPSET: &str = "flash-vip";
+
 /// VM-scoped IP set Proxmox uses for `ipfilter` on `net0`.
 pub const IPFILTER_IPSET: &str = "ipfilter-net0";
 
@@ -128,14 +133,16 @@ pub fn rules(spec: &VmSpec, nameserver: Ipv4Addr) -> Vec<FwRule> {
 
     // Inbound.
     if network.vpc_id.is_some() {
-        rules.push(FwRule {
-            direction: "in",
-            action: "ACCEPT",
-            proto: None,
-            dport: None,
-            source: Some(format!("+{VPC_IPSET}")),
-            dest: None,
-        });
+        for set in [VPC_IPSET, FLASH_SRC_IPSET] {
+            rules.push(FwRule {
+                direction: "in",
+                action: "ACCEPT",
+                proto: None,
+                dport: None,
+                source: Some(format!("+{set}")),
+                dest: None,
+            });
+        }
     }
     for rule in &network.ingress {
         let proto = match rule.protocol {
@@ -163,12 +170,9 @@ pub fn rules(spec: &VmSpec, nameserver: Ipv4Addr) -> Vec<FwRule> {
         ));
     }
     if network.vpc_id.is_some() {
-        rules.push(FwRule::out(
-            "ACCEPT",
-            None,
-            None,
-            Some(format!("+{VPC_IPSET}")),
-        ));
+        for set in [VPC_IPSET, FLASH_VIP_IPSET] {
+            rules.push(FwRule::out("ACCEPT", None, None, Some(format!("+{set}"))));
+        }
     }
     let egress = &network.egress;
     if !egress.denied_destination_cidrs.is_empty() {
@@ -274,12 +278,14 @@ mod tests {
             summary(&rules),
             vec![
                 "in ACCEPT - - +vpc -",
+                "in ACCEPT - - +flash-src -",
                 "in ACCEPT tcp 22 10.0.128.0/24,192.0.2.7 -",
                 "in ACCEPT udp 8000:8100 0.0.0.0/0 -",
                 "in ACCEPT icmp - 10.0.128.0/24 -",
                 "out ACCEPT udp 53 - 10.100.0.2",
                 "out ACCEPT tcp 53 - 10.100.0.2",
                 "out ACCEPT - - - +vpc",
+                "out ACCEPT - - - +flash-vip",
                 "out DROP - - - 198.51.100.128/25",
                 "out ACCEPT - - - 198.51.100.0/24,203.0.113.9",
             ]

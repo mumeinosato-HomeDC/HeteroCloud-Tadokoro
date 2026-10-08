@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tadokoro::{
     api::{AppState, router},
     auth::{ProviderAuthenticator, ProviderClaims},
+    flash::FlashDirectory,
     pve::PveClient,
     reconcile::{Reconciler, Settings},
 };
@@ -29,16 +30,51 @@ const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcBpAFx4KtN
 const KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAERHnScWeyI8R9LNgXVEJGjb/Cg8sopnWQJlfqkOv02 me@host";
 
+/// (vpc id, virtual IP) pairs the mock Kubernetes API publishes; `None` = API down.
+type Vips = Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>;
+
 struct Harness {
     app: Router,
     pve: Shared,
     org: Uuid,
     project: Uuid,
+    reconciler: Arc<Reconciler>,
+    vips: Vips,
+}
+
+/// A tiny Kubernetes API that answers the Service list the provider reads.
+async fn serve_kube(vips: Vips) -> String {
+    use axum::{extract::Query, routing::get};
+    let app = Router::new().route(
+        "/api/v1/namespaces/{ns}/services",
+        get(move |Query(q): Query<std::collections::HashMap<String, String>>| {
+            let vips = vips.clone();
+            async move {
+                let Some(all) = vips.lock().unwrap().clone() else {
+                    return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"message": "down"})));
+                };
+                let selector = q.get("labelSelector").cloned().unwrap_or_default();
+                let items: Vec<Value> = all
+                    .iter()
+                    .filter(|(vpc, _)| selector.contains(&format!("vpc.heterocloud.io/network={vpc}")))
+                    .filter(|_| selector.contains("vpc.heterocloud.io/vm-access=true"))
+                    .map(|(_, ip)| json!({"status": {"loadBalancer": {"ingress": [{"ip": ip}]}}}))
+                    .collect();
+                (StatusCode::OK, axum::Json(json!({"items": items})))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
 }
 
 async fn harness(max_vms: usize) -> Harness {
     let pve = new_state();
     let url = serve(pve.clone()).await;
+    let vips = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+    let kube_url = serve_kube(vips.clone()).await;
     let client = PveClient::new(
         &url,
         "tadokoro@pve!provider",
@@ -58,7 +94,9 @@ async fn harness(max_vms: usize) -> Harness {
             nameserver: Ipv4Addr::new(10, 100, 0, 2),
             search_domain: "hetero.internal".into(),
             max_vms,
+            flash_snat: vec![Ipv4Addr::new(10, 100, 0, 10)],
         },
+        Some(FlashDirectory::new(&kube_url, "flash-workloads", "token", None).unwrap()),
     );
     let authenticator = ProviderAuthenticator::from_public_keys_json(
         "heterocloud",
@@ -68,7 +106,7 @@ async fn harness(max_vms: usize) -> Harness {
     .unwrap();
     let app = router(Arc::new(AppState {
         authenticator,
-        reconciler,
+        reconciler: reconciler.clone(),
         region: "heteronet-global".into(),
     }));
     Harness {
@@ -76,6 +114,8 @@ async fn harness(max_vms: usize) -> Harness {
         pve,
         org: Uuid::now_v7(),
         project: Uuid::now_v7(),
+        reconciler,
+        vips,
     }
 }
 
@@ -407,6 +447,8 @@ async fn generation_and_scope_rules() {
         pve: h.pve.clone(),
         org: Uuid::now_v7(),
         project: h.project,
+        reconciler: h.reconciler.clone(),
+        vips: h.vips.clone(),
     };
     assert_eq!(
         put(&other, instance, 6, "svc", spec(1024, 10)).await.0,
@@ -666,4 +708,115 @@ async fn invalid_network_specs_are_rejected() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{network} -> {body}");
     }
     assert!(h.pve.lock().unwrap().calls.is_empty());
+}
+
+fn ipset(h: &Harness, instance: Uuid, name: &str) -> Vec<String> {
+    vm_of(h, instance)
+        .1
+        .ipsets
+        .get(name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn vpc_vms_may_use_the_flash_addresses_of_their_vpc_only() {
+    let h = harness(8).await;
+    let (vpc, other_vpc) = (Uuid::now_v7(), Uuid::now_v7());
+    *h.vips.lock().unwrap() = Some(vec![
+        (vpc.to_string(), "10.100.3.5".into()),
+        (other_vpc.to_string(), "10.100.3.9".into()),
+    ]);
+    let (a, b, loner) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    converge(&h, a, 1, "a", spec_with(json!({"vpc_id": vpc}))).await;
+    converge(&h, b, 1, "b", spec_with(json!({"vpc_id": vpc}))).await;
+    converge(&h, loner, 1, "loner", spec_with(json!({}))).await;
+
+    for member in [a, b] {
+        // Reach the VPC's Flash VIP; accept Flash traffic from the node address; nothing else.
+        assert_eq!(
+            ipset(&h, member, "flash-vip"),
+            vec!["10.100.3.5".to_owned()]
+        );
+        assert_eq!(
+            ipset(&h, member, "flash-src"),
+            vec!["10.100.0.10".to_owned()]
+        );
+        let rules = vm_of(&h, member).1.fw_rules;
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["type"] == "in" && r["source"] == "+flash-src")
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["type"] == "out" && r["dest"] == "+flash-vip")
+        );
+    }
+    // A VM outside any VPC gets neither, and no rule refers to them.
+    assert!(ipset(&h, loner, "flash-vip").is_empty());
+    assert!(ipset(&h, loner, "flash-src").is_empty());
+    assert!(
+        vm_of(&h, loner)
+            .1
+            .fw_rules
+            .iter()
+            .all(|r| r.get("dest").is_none_or(|d| !d.contains("flash")))
+    );
+
+    // A new Flash service appears: the periodic sync reaches already running VMs.
+    h.vips
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .push((vpc.to_string(), "10.100.3.6".into()));
+    h.reconciler.sync_all().await.unwrap();
+    for member in [a, b] {
+        assert_eq!(
+            ipset(&h, member, "flash-vip"),
+            vec!["10.100.3.5".to_owned(), "10.100.3.6".to_owned()]
+        );
+    }
+    // ...and a removed one is withdrawn.
+    h.vips
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .retain(|(_, ip)| ip != "10.100.3.5");
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(ipset(&h, a, "flash-vip"), vec!["10.100.3.6".to_owned()]);
+
+    // While the Kubernetes API is down the VMs keep what they have.
+    *h.vips.lock().unwrap() = None;
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(ipset(&h, a, "flash-vip"), vec!["10.100.3.6".to_owned()]);
+    assert_eq!(ipset(&h, a, "vpc").len(), 1, "peers are still synchronised");
+}
+
+#[tokio::test]
+async fn periodic_sync_repairs_firewall_rules_of_settled_vms() {
+    let h = harness(8).await;
+    let instance = Uuid::now_v7();
+    converge(
+        &h,
+        instance,
+        1,
+        "heal",
+        spec_with(json!({"egress": {"mode": "disabled"}})),
+    )
+    .await;
+    let (vmid, _) = vm_of(&h, instance);
+    h.pve
+        .lock()
+        .unwrap()
+        .vms
+        .get_mut(&vmid)
+        .unwrap()
+        .fw_rules
+        .clear();
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(vm_of(&h, instance).1.fw_rules.len(), 2, "dns tcp+udp only");
 }

@@ -22,7 +22,8 @@ use uuid::Uuid;
 
 use crate::{
     auth::ProviderClaims,
-    firewall::{self, IPFILTER_IPSET, VPC_IPSET},
+    firewall::{self, FLASH_SRC_IPSET, FLASH_VIP_IPSET, IPFILTER_IPSET, VPC_IPSET},
+    flash::FlashDirectory,
     ipam::{self, parse_ip_tag},
     pve::{PveClient, PveError, PveVm, VmConfig, percent_encode},
     spec::{VmSpec, slug},
@@ -73,11 +74,14 @@ pub struct Settings {
     pub nameserver: Ipv4Addr,
     pub search_domain: String,
     pub max_vms: usize,
+    /// Source addresses Flash traffic reaches VMs from.
+    pub flash_snat: Vec<Ipv4Addr>,
 }
 
 pub struct Reconciler {
     pve: PveClient,
     settings: Settings,
+    flash: Option<FlashDirectory>,
     /// Serialises VMID and address allocation (the provider runs one replica).
     allocation: Mutex<()>,
     /// VMs cloned moments ago. `cluster/resources` lags by several seconds, so
@@ -97,10 +101,11 @@ fn managed_name(name: &str) -> bool {
 }
 
 impl Reconciler {
-    pub fn new(pve: PveClient, settings: Settings) -> Arc<Self> {
+    pub fn new(pve: PveClient, settings: Settings, flash: Option<FlashDirectory>) -> Arc<Self> {
         Arc::new(Self {
             pve,
             settings,
+            flash,
             allocation: Mutex::new(()),
             recent: std::sync::Mutex::new(HashMap::new()),
         })
@@ -463,6 +468,36 @@ impl Reconciler {
             self.ensure_ipset(vmid, VPC_IPSET).await?;
         }
 
+        let in_vpc = spec.network.vpc_id;
+        let flash_src: BTreeSet<String> = if in_vpc.is_some() {
+            self.settings
+                .flash_snat
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        } else {
+            BTreeSet::new()
+        };
+        self.set_ipset(vmid, FLASH_SRC_IPSET, &flash_src).await?;
+        match (in_vpc, &self.flash) {
+            (Some(vpc), Some(directory)) => match directory.vm_addresses(vpc).await {
+                Ok(vips) => {
+                    let vips: BTreeSet<String> = vips.iter().map(ToString::to_string).collect();
+                    self.set_ipset(vmid, FLASH_VIP_IPSET, &vips).await?;
+                }
+                Err(error) => {
+                    // Keep what the VM has; the periodic sync retries.
+                    tracing::warn!(%error, %vpc, "could not read the Flash addresses of the VPC");
+                    self.ensure_ipset(vmid, FLASH_VIP_IPSET).await?;
+                }
+            },
+            (None, _) => {
+                self.set_ipset(vmid, FLASH_VIP_IPSET, &BTreeSet::new())
+                    .await?
+            }
+            (Some(_), None) => self.ensure_ipset(vmid, FLASH_VIP_IPSET).await?,
+        }
+
         let desired = firewall::rules(spec, self.settings.nameserver);
         let current = self.pve.fw_rules(vmid).await?;
         let in_sync = current.len() == desired.len()
@@ -550,6 +585,16 @@ impl Reconciler {
                 members.push((vm.vmid, ip));
             }
         }
+        let vips: Option<BTreeSet<String>> = match &self.flash {
+            Some(directory) => match directory.vm_addresses(vpc).await {
+                Ok(vips) => Some(vips.iter().map(ToString::to_string).collect()),
+                Err(error) => {
+                    tracing::warn!(%error, %vpc, "could not read the Flash addresses of the VPC");
+                    None
+                }
+            },
+            None => None,
+        };
         for (vmid, own) in &members {
             let peers: BTreeSet<String> = members
                 .iter()
@@ -557,6 +602,41 @@ impl Reconciler {
                 .map(|(_, ip)| ip.to_string())
                 .collect();
             self.set_ipset(*vmid, VPC_IPSET, &peers).await?;
+            if let Some(vips) = &vips {
+                self.set_ipset(*vmid, FLASH_VIP_IPSET, vips).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-synchronises every VPC that has VMs: peers come and go with their VMs, and
+    /// Flash services (with their virtual IPs) change without any VM command.
+    pub async fn sync_all(&self) -> Result<(), ReconcileError> {
+        let mut vpcs = BTreeSet::new();
+        for vm in self.managed().await? {
+            let config = match self.pve.config(vm.vmid).await {
+                Ok(config) if config.lock().is_none() => config,
+                Ok(_) | Err(PveError::NotFound | PveError::Locked) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            // Settled VMs only: heal drift and roll out rule changes made since they were created.
+            if let (Some(meta), Some(ip)) = (Self::meta_of(&config), Self::ip_of(&config))
+                && meta.applied_generation >= meta.generation
+                && has_firewall_flag(&config)
+            {
+                self.ensure_firewall(vm.vmid, &meta.spec, ip).await?;
+            }
+            for tag in Self::tag_values(&config) {
+                if let Some(id) = tag
+                    .strip_prefix("hc-vpc-")
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                {
+                    vpcs.insert(id);
+                }
+            }
+        }
+        for vpc in vpcs {
+            self.sync_vpc(vpc, None).await?;
         }
         Ok(())
     }
