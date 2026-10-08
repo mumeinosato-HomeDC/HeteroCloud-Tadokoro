@@ -18,6 +18,7 @@ spec:
         runAsNonRoot: true
         runAsUser: 10001
         runAsGroup: 10001
+        fsGroup: 10001
         seccompProfile: { type: RuntimeDefault }
       containers:
         - name: tadokoro
@@ -67,7 +68,7 @@ spec:
             {{- end }}
       volumes:
         - name: pve
-          secret: { secretName: {{ .Values.pve.tokenSecretName | quote }}, defaultMode: 0400 }
+          secret: { secretName: {{ .Values.pve.tokenSecretName | quote }}, defaultMode: 0440 }
         {{- if .Values.pve.caConfigMapName }}
         - name: pve-ca
           configMap: { name: {{ .Values.pve.caConfigMapName | quote }} }
