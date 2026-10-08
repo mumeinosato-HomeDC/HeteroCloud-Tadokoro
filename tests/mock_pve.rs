@@ -26,6 +26,11 @@ pub struct MockVm {
     pub config: BTreeMap<String, String>,
     /// Number of config reads before a `clone` lock disappears.
     pub lock_reads: u32,
+    /// `cluster/resources` calls that still hide this (new) VM, like pvestatd lag.
+    pub hidden_reads: u32,
+    pub fw_options: BTreeMap<String, String>,
+    pub fw_rules: Vec<BTreeMap<String, String>>,
+    pub ipsets: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Default)]
@@ -52,8 +57,12 @@ pub fn new_state() -> Shared {
                 ),
                 ("cores".into(), "2".into()),
                 ("memory".into(), "2048".into()),
+                (
+                    "net0".into(),
+                    "virtio=BC:24:11:00:00:01,bridge=hcnet,mtu=1".into(),
+                ),
             ]),
-            lock_reads: 0,
+            ..MockVm::default()
         },
     );
     Arc::new(Mutex::new(state))
@@ -104,6 +113,30 @@ pub fn router(state: Shared) -> Router {
             "/api2/json/nodes/{node}/qemu/{vmid}",
             axum::routing::delete(destroy),
         )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/firewall/options",
+            get(fw_options).put(set_fw_options),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/firewall/rules",
+            get(fw_rules).post(add_fw_rule),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/firewall/rules/{pos}",
+            axum::routing::delete(delete_fw_rule),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/firewall/ipset",
+            get(ipsets).post(create_ipset),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}",
+            get(ipset_entries).post(add_ipset_entry),
+        )
+        .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/firewall/ipset/{name}/{cidr}",
+            axum::routing::delete(delete_ipset_entry),
+        )
         .with_state(state)
 }
 
@@ -111,10 +144,11 @@ async fn resources(State(s): State<Shared>, headers: HeaderMap) -> Response {
     if !authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "no ticket");
     }
-    let s = s.lock().unwrap();
+    let mut s = s.lock().unwrap();
     let items: Vec<Value> = s
         .vms
         .iter()
+        .filter(|(_, vm)| vm.hidden_reads == 0)
         .map(|(id, vm)| {
             json!({
                 "vmid": id, "node": vm.node, "status": vm.status, "template": u8::from(vm.template),
@@ -122,6 +156,9 @@ async fn resources(State(s): State<Shared>, headers: HeaderMap) -> Response {
             })
         })
         .collect();
+    for vm in s.vms.values_mut() {
+        vm.hidden_reads = vm.hidden_reads.saturating_sub(1);
+    }
     Json(json!({"data": items})).into_response()
 }
 
@@ -162,6 +199,8 @@ async fn clone(
             template: false,
             config,
             lock_reads: 1,
+            hidden_reads: 3,
+            ..MockVm::default()
         },
     );
     s.calls.push(format!("clone {vmid}->{newid}"));
@@ -306,4 +345,181 @@ pub async fn serve(state: Shared) -> String {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
     format!("http://{addr}")
+}
+
+macro_rules! vm_or_missing {
+    ($s:expr, $vmid:expr) => {
+        match $s.vms.get_mut(&$vmid) {
+            Some(vm) => vm,
+            None => return missing($vmid),
+        }
+    };
+}
+
+async fn fw_options(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    Json(json!({"data": vm.fw_options})).into_response()
+}
+
+async fn set_fw_options(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    vm.fw_options.extend(form);
+    s.calls.push(format!("fw-options {vmid}"));
+    Json(json!({"data": null})).into_response()
+}
+
+async fn fw_rules(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    let rules: Vec<Value> = vm
+        .fw_rules
+        .iter()
+        .enumerate()
+        .map(|(pos, rule)| {
+            let mut value = json!({"pos": pos, "digest": "d"});
+            for (k, v) in rule {
+                value[k] = if k == "enable" { json!(1) } else { json!(v) };
+            }
+            value
+        })
+        .collect();
+    Json(json!({"data": rules})).into_response()
+}
+
+async fn add_fw_rule(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    vm.fw_rules.push(form.into_iter().collect());
+    s.calls.push(format!("fw-rule-add {vmid}"));
+    Json(json!({"data": null})).into_response()
+}
+
+async fn delete_fw_rule(
+    State(s): State<Shared>,
+    Path((_n, vmid, pos)): Path<(String, u32, usize)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    if pos >= vm.fw_rules.len() {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "no such rule");
+    }
+    vm.fw_rules.remove(pos);
+    s.calls.push(format!("fw-rule-del {vmid}"));
+    Json(json!({"data": null})).into_response()
+}
+
+async fn ipsets(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    let names: Vec<Value> = vm.ipsets.keys().map(|n| json!({"name": n})).collect();
+    Json(json!({"data": names})).into_response()
+}
+
+async fn create_ipset(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    vm.ipsets.entry(form["name"].clone()).or_default();
+    Json(json!({"data": null})).into_response()
+}
+
+async fn ipset_entries(
+    State(s): State<Shared>,
+    Path((_n, vmid, name)): Path<(String, u32, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    let Some(entries) = vm.ipsets.get(&name) else {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "no such ipset");
+    };
+    let items: Vec<Value> = entries.iter().map(|c| json!({"cidr": c})).collect();
+    Json(json!({"data": items})).into_response()
+}
+
+async fn add_ipset_entry(
+    State(s): State<Shared>,
+    Path((_n, vmid, name)): Path<(String, u32, String)>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    vm.ipsets
+        .entry(name)
+        .or_default()
+        .push(form["cidr"].clone());
+    Json(json!({"data": null})).into_response()
+}
+
+async fn delete_ipset_entry(
+    State(s): State<Shared>,
+    Path((_n, vmid, name, cidr)): Path<(String, u32, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let vm = vm_or_missing!(s, vmid);
+    if let Some(entries) = vm.ipsets.get_mut(&name) {
+        entries.retain(|c| c != &cidr);
+    }
+    Json(json!({"data": null})).into_response()
 }
