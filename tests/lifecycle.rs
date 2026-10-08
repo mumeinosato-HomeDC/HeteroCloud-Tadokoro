@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 use tadokoro::{
     api::{AppState, router},
     auth::{ProviderAuthenticator, ProviderClaims},
+    flash::FlashDirectory,
     pve::PveClient,
     reconcile::{Reconciler, Settings},
 };
@@ -29,16 +30,51 @@ const PUBLIC_KEY: &str = "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAcBpAFx4KtN
 const KEY: &str =
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAERHnScWeyI8R9LNgXVEJGjb/Cg8sopnWQJlfqkOv02 me@host";
 
+/// (vpc id, virtual IP) pairs the mock Kubernetes API publishes; `None` = API down.
+type Vips = Arc<std::sync::Mutex<Option<Vec<(String, String)>>>>;
+
 struct Harness {
     app: Router,
     pve: Shared,
     org: Uuid,
     project: Uuid,
+    reconciler: Arc<Reconciler>,
+    vips: Vips,
+}
+
+/// A tiny Kubernetes API that answers the Service list the provider reads.
+async fn serve_kube(vips: Vips) -> String {
+    use axum::{extract::Query, routing::get};
+    let app = Router::new().route(
+        "/api/v1/namespaces/{ns}/services",
+        get(move |Query(q): Query<std::collections::HashMap<String, String>>| {
+            let vips = vips.clone();
+            async move {
+                let Some(all) = vips.lock().unwrap().clone() else {
+                    return (StatusCode::SERVICE_UNAVAILABLE, axum::Json(json!({"message": "down"})));
+                };
+                let selector = q.get("labelSelector").cloned().unwrap_or_default();
+                let items: Vec<Value> = all
+                    .iter()
+                    .filter(|(vpc, _)| selector.contains(&format!("vpc.heterocloud.io/network={vpc}")))
+                    .filter(|_| selector.contains("vpc.heterocloud.io/vm-access=true"))
+                    .map(|(_, ip)| json!({"status": {"loadBalancer": {"ingress": [{"ip": ip}]}}}))
+                    .collect();
+                (StatusCode::OK, axum::Json(json!({"items": items})))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    format!("http://{addr}")
 }
 
 async fn harness(max_vms: usize) -> Harness {
     let pve = new_state();
     let url = serve(pve.clone()).await;
+    let vips = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
+    let kube_url = serve_kube(vips.clone()).await;
     let client = PveClient::new(
         &url,
         "tadokoro@pve!provider",
@@ -58,7 +94,10 @@ async fn harness(max_vms: usize) -> Harness {
             nameserver: Ipv4Addr::new(10, 100, 0, 2),
             search_domain: "hetero.internal".into(),
             max_vms,
+            flash_snat: vec![Ipv4Addr::new(10, 100, 0, 10)],
         },
+        Some(FlashDirectory::new(&kube_url, "flash-workloads", "token", None).unwrap()),
+        None,
     );
     let authenticator = ProviderAuthenticator::from_public_keys_json(
         "heterocloud",
@@ -68,7 +107,7 @@ async fn harness(max_vms: usize) -> Harness {
     .unwrap();
     let app = router(Arc::new(AppState {
         authenticator,
-        reconciler,
+        reconciler: reconciler.clone(),
         region: "heteronet-global".into(),
     }));
     Harness {
@@ -76,6 +115,8 @@ async fn harness(max_vms: usize) -> Harness {
         pve,
         org: Uuid::now_v7(),
         project: Uuid::now_v7(),
+        reconciler,
+        vips,
     }
 }
 
@@ -407,10 +448,376 @@ async fn generation_and_scope_rules() {
         pve: h.pve.clone(),
         org: Uuid::now_v7(),
         project: h.project,
+        reconciler: h.reconciler.clone(),
+        vips: h.vips.clone(),
     };
     assert_eq!(
         put(&other, instance, 6, "svc", spec(1024, 10)).await.0,
         StatusCode::FORBIDDEN
     );
     assert_eq!(remove(&other, instance, 6).await.0, StatusCode::FORBIDDEN);
+}
+
+fn spec_with(network: Value) -> Value {
+    let mut s = spec(1024, 10);
+    s["network"] = network;
+    s
+}
+
+fn calls(h: &Harness) -> Vec<String> {
+    h.pve.lock().unwrap().calls.clone()
+}
+
+#[tokio::test]
+async fn firewall_is_enforced_before_the_vm_starts() {
+    let h = harness(8).await;
+    let instance = Uuid::now_v7();
+    let network = json!({
+        "ingress": [{"protocol": "tcp", "ports": "22", "source_cidrs": ["10.0.128.0/24"]}],
+        "egress": {"mode": "internet"}
+    });
+    let body = converge(&h, instance, 1, "fw", spec_with(network)).await;
+    assert_eq!(body["status"]["firewall"], "enforced");
+    let (vmid, vm) = vm_of(&h, instance);
+    assert!(
+        vm.config["net0"].split(',').any(|p| p == "firewall=1"),
+        "{}",
+        vm.config["net0"]
+    );
+    for (key, want) in [
+        ("enable", "1"),
+        ("policy_in", "DROP"),
+        ("policy_out", "DROP"),
+        ("ipfilter", "1"),
+        ("macfilter", "1"),
+    ] {
+        assert_eq!(
+            vm.fw_options.get(key).map(String::as_str),
+            Some(want),
+            "{key}"
+        );
+    }
+    assert_eq!(vm.ipsets["ipfilter-net0"], vec!["10.100.16.1".to_owned()]);
+    // ssh in, dns udp+tcp, drop private, accept the rest.
+    assert_eq!(vm.fw_rules.len(), 5);
+    assert_eq!(vm.fw_rules[0]["type"], "in");
+    assert_eq!(vm.fw_rules[0]["dport"], "22");
+    assert_eq!(vm.fw_rules[0]["source"], "10.0.128.0/24");
+    // First match wins: the catch-all accept must come after the private-range drop.
+    let last = vm.fw_rules.last().expect("rules");
+    assert_eq!(last["type"], "out");
+    assert_eq!(last["action"], "ACCEPT");
+    assert!(!last.contains_key("dest"));
+    assert_eq!(vm.fw_rules[vm.fw_rules.len() - 2]["action"], "DROP");
+    assert!(vm.fw_rules.iter().all(|r| r["comment"] == "tadokoro"));
+    let log = calls(&h);
+    let options = log
+        .iter()
+        .position(|c| c == &format!("fw-options {vmid}"))
+        .expect("options set");
+    let start = log
+        .iter()
+        .position(|c| c == &format!("start {vmid}"))
+        .expect("started");
+    assert!(
+        options < start,
+        "firewall must be enabled before the first boot: {log:?}"
+    );
+}
+
+#[tokio::test]
+async fn vpc_members_see_each_other_and_only_each_other() {
+    let h = harness(8).await;
+    let vpc = Uuid::now_v7();
+    let (a, b, c) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    let in_vpc = || spec_with(json!({"vpc_id": vpc}));
+    converge(&h, a, 1, "a", in_vpc()).await;
+    converge(&h, b, 1, "b", in_vpc()).await;
+    converge(&h, c, 1, "c", spec_with(json!({"vpc_id": Uuid::now_v7()}))).await;
+
+    let ips = |instance| {
+        let (_, vm) = vm_of(&h, instance);
+        vm.config["tags"]
+            .split(';')
+            .find_map(|t| t.strip_prefix("hc-ip-"))
+            .unwrap()
+            .replace('-', ".")
+    };
+    let (ip_a, ip_b, ip_c) = (ips(a), ips(b), ips(c));
+    assert_eq!(vm_of(&h, a).1.ipsets["vpc"], vec![ip_b.clone()]);
+    assert_eq!(vm_of(&h, b).1.ipsets["vpc"], vec![ip_a.clone()]);
+    assert_eq!(vm_of(&h, c).1.ipsets["vpc"], Vec::<String>::new());
+    assert!(!vm_of(&h, a).1.ipsets["vpc"].contains(&ip_c));
+    // The peer rule exists in both directions.
+    let rules = vm_of(&h, a).1.fw_rules;
+    assert!(
+        rules
+            .iter()
+            .any(|r| r["type"] == "in" && r["source"] == "+vpc")
+    );
+    assert!(
+        rules
+            .iter()
+            .any(|r| r["type"] == "out" && r["dest"] == "+vpc")
+    );
+    assert!(vm_of(&h, a).1.config["tags"].contains(&format!("hc-vpc-{}", vpc.simple())));
+
+    // Moving b out of the VPC removes it from a's peers and drops the peer rules.
+    converge(&h, b, 2, "b", spec_with(json!({}))).await;
+    assert_eq!(vm_of(&h, a).1.ipsets["vpc"], Vec::<String>::new());
+    assert!(
+        vm_of(&h, b)
+            .1
+            .fw_rules
+            .iter()
+            .all(|r| r.get("source").map(String::as_str) != Some("+vpc"))
+    );
+
+    // Deleting a VM leaves the others' peer sets clean before it disappears.
+    converge(&h, b, 3, "b", in_vpc()).await;
+    assert_eq!(vm_of(&h, a).1.ipsets["vpc"].len(), 1);
+    for _ in 0..5 {
+        if remove(&h, b, 4).await.0 == StatusCode::ACCEPTED {
+            break;
+        }
+    }
+    assert_eq!(vm_of(&h, a).1.ipsets["vpc"], Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn a_quick_retry_does_not_clone_twice() {
+    let h = harness(8).await;
+    let instance = Uuid::now_v7();
+    // The resource list hides new VMs for a few reads; retries must not duplicate.
+    for _ in 0..3 {
+        let (status, _) = put(&h, instance, 1, "dup", spec(1024, 10)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    }
+    converge(&h, instance, 1, "dup", spec(1024, 10)).await;
+    assert_eq!(
+        calls(&h).iter().filter(|c| c.starts_with("clone")).count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn parallel_creates_never_share_an_address() {
+    let h = harness(16).await;
+    let instances: Vec<Uuid> = (0..4).map(|_| Uuid::now_v7()).collect();
+    // Interleave the polls of four VMs, as concurrent worker events would.
+    let mut done = std::collections::BTreeMap::new();
+    for _ in 0..60 {
+        for instance in &instances {
+            if done.contains_key(instance) {
+                continue;
+            }
+            let (status, body) = put(&h, *instance, 1, "p", spec(1024, 10)).await;
+            if status == StatusCode::ACCEPTED {
+                done.insert(
+                    *instance,
+                    body["status"]["ip_address"].as_str().unwrap().to_owned(),
+                );
+            }
+        }
+        if done.len() == instances.len() {
+            break;
+        }
+    }
+    assert_eq!(done.len(), 4);
+    let mut ips: Vec<String> = done.into_values().collect();
+    ips.sort();
+    ips.dedup();
+    assert_eq!(ips.len(), 4);
+}
+
+#[tokio::test]
+async fn drifted_and_pre_firewall_vms_are_repaired() {
+    let h = harness(8).await;
+    let instance = Uuid::now_v7();
+    converge(
+        &h,
+        instance,
+        1,
+        "old",
+        spec_with(json!({"egress": {"mode": "disabled"}})),
+    )
+    .await;
+    let (vmid, _) = vm_of(&h, instance);
+    {
+        // Pretend the VM predates the firewall and someone wiped its rules.
+        let mut s = h.pve.lock().unwrap();
+        let vm = s.vms.get_mut(&vmid).unwrap();
+        let net0 = vm.config["net0"].replace(",firewall=1", "");
+        vm.config.insert("net0".into(), net0);
+        vm.fw_rules.clear();
+        vm.fw_options.clear();
+        s.calls.clear();
+    }
+    converge(
+        &h,
+        instance,
+        1,
+        "old",
+        spec_with(json!({"egress": {"mode": "disabled"}})),
+    )
+    .await;
+    let (_, vm) = vm_of(&h, instance);
+    assert!(vm.config["net0"].contains("firewall=1"));
+    assert_eq!(vm.fw_rules.len(), 2);
+    assert_eq!(vm.fw_options.get("enable").map(String::as_str), Some("1"));
+    let log = calls(&h);
+    assert!(
+        log.iter().any(|c| c == &format!("stop {vmid}")),
+        "a running VM is restarted to attach the filtered NIC: {log:?}"
+    );
+    assert_eq!(vm.status, "running");
+
+    // A drifted rule set is also repaired while the VM keeps running.
+    {
+        let mut s = h.pve.lock().unwrap();
+        s.vms.get_mut(&vmid).unwrap().fw_rules.pop();
+        s.calls.clear();
+    }
+    converge(
+        &h,
+        instance,
+        1,
+        "old",
+        spec_with(json!({"egress": {"mode": "disabled"}})),
+    )
+    .await;
+    assert_eq!(vm_of(&h, instance).1.fw_rules.len(), 2);
+    assert!(!calls(&h).iter().any(|c| c.starts_with("stop")));
+}
+
+#[tokio::test]
+async fn invalid_network_specs_are_rejected() {
+    let h = harness(8).await;
+    let bad = [
+        json!({"ingress": [{"protocol": "tcp", "source_cidrs": ["10.0.0.0/8"]}]}),
+        json!({"ingress": [{"protocol": "icmp", "ports": "22", "source_cidrs": ["10.0.0.0/8"]}]}),
+        json!({"ingress": [{"protocol": "tcp", "ports": "70000", "source_cidrs": ["10.0.0.0/8"]}]}),
+        json!({"ingress": [{"protocol": "tcp", "ports": "22", "source_cidrs": []}]}),
+        json!({"ingress": [{"protocol": "tcp", "ports": "22", "source_cidrs": ["not-a-cidr"]}]}),
+        json!({"egress": {"mode": "internet", "allowed_destination_cidrs": ["198.51.100.0/24"]}}),
+        json!({"egress": {"mode": "restricted", "allowed_destination_cidrs": ["10.100.0.0/16"]}}),
+        json!({"egress": {"mode": "restricted", "allowed_destination_cidrs": ["8.0.0.0/5"]}}),
+        json!({"unknown": true}),
+    ];
+    for network in bad {
+        let (status, body) = put(&h, Uuid::now_v7(), 1, "x", spec_with(network.clone())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{network} -> {body}");
+    }
+    assert!(h.pve.lock().unwrap().calls.is_empty());
+}
+
+fn ipset(h: &Harness, instance: Uuid, name: &str) -> Vec<String> {
+    vm_of(h, instance)
+        .1
+        .ipsets
+        .get(name)
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn vpc_vms_may_use_the_flash_addresses_of_their_vpc_only() {
+    let h = harness(8).await;
+    let (vpc, other_vpc) = (Uuid::now_v7(), Uuid::now_v7());
+    *h.vips.lock().unwrap() = Some(vec![
+        (vpc.to_string(), "10.100.3.5".into()),
+        (other_vpc.to_string(), "10.100.3.9".into()),
+    ]);
+    let (a, b, loner) = (Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7());
+    converge(&h, a, 1, "a", spec_with(json!({"vpc_id": vpc}))).await;
+    converge(&h, b, 1, "b", spec_with(json!({"vpc_id": vpc}))).await;
+    converge(&h, loner, 1, "loner", spec_with(json!({}))).await;
+
+    for member in [a, b] {
+        // Reach the VPC's Flash VIP; accept Flash traffic from the node address; nothing else.
+        assert_eq!(
+            ipset(&h, member, "flash-vip"),
+            vec!["10.100.3.5".to_owned()]
+        );
+        assert_eq!(
+            ipset(&h, member, "flash-src"),
+            vec!["10.100.0.10".to_owned()]
+        );
+        let rules = vm_of(&h, member).1.fw_rules;
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["type"] == "in" && r["source"] == "+flash-src")
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["type"] == "out" && r["dest"] == "+flash-vip")
+        );
+    }
+    // A VM outside any VPC gets neither, and no rule refers to them.
+    assert!(ipset(&h, loner, "flash-vip").is_empty());
+    assert!(ipset(&h, loner, "flash-src").is_empty());
+    assert!(
+        vm_of(&h, loner)
+            .1
+            .fw_rules
+            .iter()
+            .all(|r| r.get("dest").is_none_or(|d| !d.contains("flash")))
+    );
+
+    // A new Flash service appears: the periodic sync reaches already running VMs.
+    h.vips
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .push((vpc.to_string(), "10.100.3.6".into()));
+    h.reconciler.sync_all().await.unwrap();
+    for member in [a, b] {
+        assert_eq!(
+            ipset(&h, member, "flash-vip"),
+            vec!["10.100.3.5".to_owned(), "10.100.3.6".to_owned()]
+        );
+    }
+    // ...and a removed one is withdrawn.
+    h.vips
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .retain(|(_, ip)| ip != "10.100.3.5");
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(ipset(&h, a, "flash-vip"), vec!["10.100.3.6".to_owned()]);
+
+    // While the Kubernetes API is down the VMs keep what they have.
+    *h.vips.lock().unwrap() = None;
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(ipset(&h, a, "flash-vip"), vec!["10.100.3.6".to_owned()]);
+    assert_eq!(ipset(&h, a, "vpc").len(), 1, "peers are still synchronised");
+}
+
+#[tokio::test]
+async fn periodic_sync_repairs_firewall_rules_of_settled_vms() {
+    let h = harness(8).await;
+    let instance = Uuid::now_v7();
+    converge(
+        &h,
+        instance,
+        1,
+        "heal",
+        spec_with(json!({"egress": {"mode": "disabled"}})),
+    )
+    .await;
+    let (vmid, _) = vm_of(&h, instance);
+    h.pve
+        .lock()
+        .unwrap()
+        .vms
+        .get_mut(&vmid)
+        .unwrap()
+        .fw_rules
+        .clear();
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(vm_of(&h, instance).1.fw_rules.len(), 2, "dns tcp+udp only");
 }

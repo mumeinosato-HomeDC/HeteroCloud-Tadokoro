@@ -34,6 +34,25 @@ vm:
   searchDomain: hetero.internal
   maxVms: 32
 
+# Lets VMs of a VPC reach the Flash services of the same VPC. Tadokoro reads (read-only)
+# the VM-facing virtual IPs the VPC provider publishes as Services in this namespace.
+flash:
+  enabled: false
+  namespace: heterocloud-flash-workloads
+  # Source address Flash traffic reaches the VMs from (the node address pod traffic is
+  # translated to). The VMs of a VPC accept traffic from it.
+  snatAddresses: []
+  syncSeconds: 30
+
+# Registers names for VMs and the VM-facing addresses of Flash services through RFC 2136.
+dns:
+  enabled: false
+  server: ""                 # host:port of the primary, e.g. 10.100.0.2:53
+  zone: hetero.internal
+  ttl: 60
+  # Secret with the BIND-format TSIG key under the key `tsig.key`.
+  keySecretName: tadokoro-dns
+
 resources:
   requests: { cpu: 50m, memory: 64Mi }
   limits: { cpu: 500m, memory: 256Mi }
