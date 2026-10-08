@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use crate::{
     auth::ProviderClaims,
+    dns::{self, DnsUpdater, Records},
     firewall::{self, FLASH_SRC_IPSET, FLASH_VIP_IPSET, IPFILTER_IPSET, VPC_IPSET},
     flash::FlashDirectory,
     ipam::{self, parse_ip_tag},
@@ -82,6 +83,7 @@ pub struct Reconciler {
     pve: PveClient,
     settings: Settings,
     flash: Option<FlashDirectory>,
+    dns: Option<DnsUpdater>,
     /// Serialises VMID and address allocation (the provider runs one replica).
     allocation: Mutex<()>,
     /// VMs cloned moments ago. `cluster/resources` lags by several seconds, so
@@ -101,11 +103,17 @@ fn managed_name(name: &str) -> bool {
 }
 
 impl Reconciler {
-    pub fn new(pve: PveClient, settings: Settings, flash: Option<FlashDirectory>) -> Arc<Self> {
+    pub fn new(
+        pve: PveClient,
+        settings: Settings,
+        flash: Option<FlashDirectory>,
+        dns: Option<DnsUpdater>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             pve,
             settings,
             flash,
+            dns,
             allocation: Mutex::new(()),
             recent: std::sync::Mutex::new(HashMap::new()),
         })
@@ -450,7 +458,84 @@ impl Reconciler {
         if let Some(old) = previous_vpc.filter(|old| Some(*old) != spec.network.vpc_id) {
             self.sync_vpc(old, None).await?;
         }
+        self.sync_dns_best_effort().await;
         Ok(())
+    }
+
+    /// The A records every settled VM and VPC-attached Flash service should have.
+    async fn desired_dns(&self, zone: &str) -> Result<Records, ReconcileError> {
+        let mut records = Records::new();
+        let mut vpcs = BTreeSet::new();
+        for vm in self.managed().await? {
+            let config = match self.pve.config(vm.vmid).await {
+                // A locked VM cannot be read right now; deleting its names because of that
+                // would make them flap, so the round is skipped instead.
+                Ok(config) if config.lock().is_some() => return Err(ReconcileError::NotReady),
+                Ok(config) => config,
+                Err(PveError::Locked) => return Err(ReconcileError::NotReady),
+                Err(PveError::NotFound) => continue,
+                Err(error) => return Err(error.into()),
+            };
+            // A clone that is not configured yet has no name to publish.
+            let (Some(meta), Some(ip)) = (Self::meta_of(&config), Self::ip_of(&config)) else {
+                continue;
+            };
+            let id = meta.service_instance_id;
+            records
+                .entry(dns::vm_canonical_name(zone, &meta.name, id))
+                .or_default()
+                .insert(ip);
+            if let Some(vpc) = meta.spec.network.vpc_id {
+                vpcs.insert(vpc);
+                records
+                    .entry(dns::vm_vpc_alias(zone, &meta.name, vpc))
+                    .or_default()
+                    .insert(ip);
+            }
+        }
+        if let Some(directory) = &self.flash {
+            for vpc in vpcs {
+                // A failed lookup aborts the round: absent names would be deleted.
+                let services = directory
+                    .vm_services(vpc)
+                    .await
+                    .map_err(|e| ReconcileError::BadRequest(e.to_string()))?;
+                for (name, ip) in services {
+                    if let Some(name) = name {
+                        records
+                            .entry(dns::service_name(zone, &name, vpc))
+                            .or_default()
+                            .insert(ip);
+                    }
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    /// Declarative DNS sync: owned subtrees of the zone end up exactly as desired.
+    pub async fn sync_dns(&self) -> Result<(), ReconcileError> {
+        let Some(updater) = &self.dns else {
+            return Ok(());
+        };
+        let desired = self.desired_dns(updater.zone()).await?;
+        match updater.reconcile(&desired).await {
+            Ok((changed, removed)) if changed + removed > 0 => {
+                tracing::info!(changed, removed, "DNS records synchronised");
+                Ok(())
+            }
+            Ok(_) => Ok(()),
+            Err(error) => Err(ReconcileError::BadRequest(error.to_string())),
+        }
+    }
+
+    async fn sync_dns_best_effort(&self) {
+        match self.sync_dns().await {
+            Ok(()) | Err(ReconcileError::NotReady) => {}
+            Err(error) => {
+                tracing::warn!(%error, "DNS synchronisation failed; the periodic sync retries");
+            }
+        }
     }
 
     /// Make the VM's firewall options, IP sets and rules match the spec.
@@ -638,6 +723,7 @@ impl Reconciler {
         for vpc in vpcs {
             self.sync_vpc(vpc, None).await?;
         }
+        self.sync_dns_best_effort().await;
         Ok(())
     }
 
@@ -699,6 +785,7 @@ impl Reconciler {
         generation: i64,
     ) -> Result<Value, ReconcileError> {
         let Some(vm) = self.find(claims.service_instance_id).await? else {
+            self.sync_dns_best_effort().await;
             return Ok(Self::deleted_status(generation));
         };
         let config = self.locked_config(vm.vmid).await?;
@@ -706,6 +793,13 @@ impl Reconciler {
             Self::check_identity(&meta, claims)?;
             if generation < meta.generation {
                 return Err(ReconcileError::Conflict("generation is stale".into()));
+            }
+            if let Some(updater) = &self.dns {
+                let name =
+                    dns::vm_canonical_name(updater.zone(), &meta.name, meta.service_instance_id);
+                if let Err(error) = updater.delete(&name).await {
+                    tracing::warn!(%error, %name, "could not remove the VM's DNS name");
+                }
             }
             if let Some(vpc) = meta.spec.network.vpc_id {
                 // Peers stop allowing this address before the VM goes away.

@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 pub const VPC_LABEL: &str = "vpc.heterocloud.io/network";
 pub const VM_ACCESS_LABEL: &str = "vpc.heterocloud.io/vm-access";
+pub const PRIVATE_NAME_ANNOTATION: &str = "vpc.heterocloud.io/private-name";
 
 #[derive(Debug, Error)]
 pub enum FlashError {
@@ -72,6 +73,19 @@ impl FlashDirectory {
 
     /// Virtual IPs of the VPC's members that the VMs may reach.
     pub async fn vm_addresses(&self, vpc: Uuid) -> Result<BTreeSet<Ipv4Addr>, FlashError> {
+        Ok(self
+            .vm_services(vpc)
+            .await?
+            .into_iter()
+            .map(|(_, ip)| ip)
+            .collect())
+    }
+
+    /// The same, with the private name the member is known by inside the VPC.
+    pub async fn vm_services(
+        &self,
+        vpc: Uuid,
+    ) -> Result<Vec<(Option<String>, Ipv4Addr)>, FlashError> {
         let url = format!(
             "{}/api/v1/namespaces/{}/services",
             self.base, self.namespace
@@ -94,22 +108,26 @@ impl FlashDirectory {
             .json()
             .await
             .map_err(|e| FlashError::Request(e.to_string()))?;
-        Ok(parse_addresses(&body))
+        Ok(parse_services(&body))
     }
 }
 
-fn parse_addresses(list: &Value) -> BTreeSet<Ipv4Addr> {
+fn parse_services(list: &Value) -> Vec<(Option<String>, Ipv4Addr)> {
     list["items"]
         .as_array()
         .into_iter()
         .flatten()
         .flat_map(|item| {
+            let name = item["metadata"]["annotations"][PRIVATE_NAME_ANNOTATION]
+                .as_str()
+                .map(str::to_owned);
             item["status"]["loadBalancer"]["ingress"]
                 .as_array()
                 .into_iter()
                 .flatten()
+                .filter_map(|ingress| ingress["ip"].as_str()?.parse().ok())
+                .map(move |ip| (name.clone(), ip))
         })
-        .filter_map(|ingress| ingress["ip"].as_str()?.parse().ok())
         .collect()
 }
 
@@ -128,11 +146,24 @@ mod tests {
             {"status": {"loadBalancer": {}}},
             {"status": {"loadBalancer": {"ingress": [{"ip": "10.100.3.2"}, {"ip": "10.100.3.1"}]}}}
         ]});
-        let ips: Vec<String> = parse_addresses(&list)
+        let mut ips: Vec<String> = parse_services(&list)
             .iter()
-            .map(ToString::to_string)
+            .map(|(_, ip)| ip.to_string())
             .collect();
-        assert_eq!(ips, vec!["10.100.3.1", "10.100.3.2"]);
-        assert!(parse_addresses(&json!({})).is_empty());
+        ips.sort();
+        assert_eq!(ips, vec!["10.100.3.1", "10.100.3.1", "10.100.3.2"]);
+        assert!(parse_services(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn keeps_the_private_name_annotation() {
+        let list = json!({"items": [{
+            "metadata": {"annotations": {PRIVATE_NAME_ANNOTATION: "web"}},
+            "status": {"loadBalancer": {"ingress": [{"ip": "10.100.3.7"}]}}
+        }]});
+        assert_eq!(
+            parse_services(&list),
+            vec![(Some("web".to_owned()), "10.100.3.7".parse().unwrap())]
+        );
     }
 }

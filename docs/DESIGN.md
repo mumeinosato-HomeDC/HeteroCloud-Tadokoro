@@ -147,6 +147,48 @@ VM  ◀──  Flash pod (source NATed to the node address 10.100.0.10)
 VM of VPC B. The VM → Flash direction is exact (one virtual IP per service, one firewall per VM). Closing the
 gap needs a per-VPC egress address (the VPC provider's EgressGateway with a dedicated EIP per VPC).
 
+## DNS
+
+With `dns.enabled`, Tadokoro keeps names in the platform zone (`hetero.internal`) through
+RFC 2136 dynamic updates signed with a TSIG key:
+
+| Name | Points to |
+| --- | --- |
+| `<slug>-<id8>.vm.<zone>` | the VM (globally unique) |
+| `<slug>.vm.<vpc8>.vpc.<zone>` | the same VM, inside its VPC |
+| `<name>.svc.<vpc8>.vpc.<zone>` | a Flash service of the VPC (its VM-facing virtual IP) |
+
+`id8`/`vpc8` are the last eight hex digits of the id: UUIDv7 begins with a timestamp, so the first
+digits are shared by everything created within about a minute. A VM registers when its
+configuration is applied and its canonical name is removed when deletion starts.
+
+The state is declarative: every sync (`TADOKORO_VPC_SYNC_SECONDS`, and after every VM change)
+computes the wanted records from Proxmox and Kubernetes, reads the owned subtrees with a zone
+transfer and replaces, adds or removes records until they match. Stale names of vanished VMs or Flash
+services therefore disappear on their own. If Proxmox or the Kubernetes lookup fails, the round is
+skipped instead of deleting names that could not be verified.
+
+The zone transfer is read-only input and is parsed without verifying its TSIG chain (BIND signs only
+some messages of a transfer); the updates and their answers are fully signed and verified.
+
+BIND is configured so the provider's key cannot touch anything else:
+
+```
+zone "hetero.internal" {
+  type primary;
+  file "/var/bind/dyn/hetero.internal.zone";
+  update-policy {
+    grant hetero-update zonesub ANY;                                   # admin key
+    grant tadokoro-update subdomain vm.hetero.internal. ANY;
+    grant tadokoro-update subdomain vpc.hetero.internal. ANY;
+  };
+  allow-transfer { key tadokoro-update; key hetero-update; };
+};
+```
+
+Records of other tenants are visible to any VM that can query the resolver, but the addresses stay
+unreachable without the firewall rules of a shared VPC.
+
 ## Proxmox permissions
 
 `scripts/pve-setup.sh` creates the role `HCTadokoro`, user `tadokoro@pve` and an
