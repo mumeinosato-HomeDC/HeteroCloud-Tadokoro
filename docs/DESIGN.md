@@ -1,0 +1,100 @@
+# Tadokoro design
+
+Tadokoro is the HeteroCloud `provider/v1` service for virtual machines. It
+turns a strict VM spec into a Proxmox VE VM on one chosen node (`pve02`). It is
+modelled on the Flash provider: HeteroCloud signs a short-lived Ed25519 command,
+the provider authenticates it, and a repeated, idempotent `PUT` drives the
+resource towards the requested generation.
+
+```
+HeteroCloud worker ──PUT/DELETE/GET (JWT aud=heterocloud-vm)──▶ Tadokoro ──API token──▶ Proxmox VE (pve02)
+                                                                         └─ VM on the hcnet VNet (10.100.0.0/16)
+```
+
+## Contract
+
+| Route | Action claim | Result |
+| --- | --- | --- |
+| `PUT /internal/v1/service-instances/{id}` | `service-instance.reconcile` | `202` + `{operation_id, status}` when converged, `503` + `Retry-After` while working |
+| `DELETE /internal/v1/service-instances/{id}?generation=N` | `service-instance.delete` | `202` with `phase: deleted` once the VM is gone |
+| `GET /internal/v1/service-instances/{id}?generation=N` | `vm.status.get` | current status |
+| `GET /health/live`, `/health/ready` | – | readiness checks Proxmox reachability |
+
+Authentication matches Flash: EdDSA, exact issuer/audience/action, 60 s lifetime,
+`nbf = iat - 5`, and `claims.generation` must equal the request generation.
+Audience `heterocloud-vm` keeps these tokens unusable at other providers.
+Status codes: `409` for a stale generation or a generation reused with different
+state, `403` for tenant or instance mismatch, `507` when the address pool or VM
+limit is exhausted, `400` for an invalid spec.
+
+## Spec
+
+```json
+{
+  "region": "heteronet-global",
+  "image": "ubuntu-26.04",
+  "cpu_cores": 2,
+  "memory_mib": 2048,
+  "disk_gib": 20,
+  "ssh_authorized_keys": ["ssh-ed25519 AAAA… me@host"],
+  "username": "ubuntu",
+  "stopped": false,
+  "metadata": {}
+}
+```
+
+Unknown fields are rejected. The image name maps to a template VMID on the node.
+Disks only grow and the image cannot change after creation.
+
+## State lives on the VM
+
+The provider has no database. Everything it needs is on the Proxmox VM:
+
+* **name** – `<slug>-<instance id, 32 hex>`; the suffix is the lookup key.
+* **tags** – `hc-vm;hc-ip-a-b-c-d`; the address tag is also the IPAM record.
+* **description** – JSON `{organization_id, project_id, service_instance_id, name, generation, applied_generation, spec}`.
+
+Each `PUT` is a small state machine:
+
+1. No VM → allocate a VMID, full-clone the template (VM is `lock: clone`) → `503`.
+2. Locked → `503`.
+3. Unconfigured clone, or a newer generation → write the accepted generation to
+   the description, then apply: cores, memory, balloon off, cloud-init user and
+   keys, static address, DNS, tags, `onboot`, and grow the disk. CPU/memory/user/key
+   changes on a running VM first request a graceful shutdown (hard stop after 60 s).
+4. Config applied → bring the power state in line with `spec.stopped` → `202` when
+   it matches.
+
+Because every step reads Proxmox again, a restart or a retried command never loses
+or duplicates work. Allocation of VMIDs and addresses is serialised in-process, so
+**run exactly one replica**.
+
+## Network
+
+VMs attach to the SDN VNet `hcnet` (VXLAN zone `hcz`, `10.100.0.0/16`). Addresses
+come from `10.100.16.0/20`, leaving `10.100.0.0/20` for infrastructure and the
+MetalLB pools (`10.100.1.x`, `10.100.2.0/24`, `10.100.3.0/24`) untouched.
+The gateway `10.100.0.1` (NAT to the LAN) and DNS `10.100.0.2` are pushed into
+cloud-init. Two lessons from the lab:
+
+* The path between the two PVE sites has an MTU of 1420, so the VXLAN zone MTU is
+  1370 and every VM NIC uses `mtu=1` (inherit the bridge MTU). Without it TLS and
+  SSH stall while ping works.
+* `cicustom` can only be set by `root@pam`, so the provider never uses it; the
+  guest agent is baked into the template instead (`scripts/make-template.sh`).
+
+## Proxmox permissions
+
+`scripts/pve-setup.sh` creates the role `HCTadokoro`, user `tadokoro@pve` and an
+API token. The ACLs cover `/vms`, `/storage/local-lvm`, `/sdn/zones/hcz` and
+`/nodes/pve02`; the provider cannot touch other nodes or datacenter settings. The
+token secret is mounted from a Kubernetes Secret and never logged.
+
+## Not yet implemented
+
+* HeteroCloud core support for a `vm` service kind (domain spec, store, worker
+  dispatch, IAM actions `vm:*`, CLI and console). Until then the provider is driven
+  by signed `provider/v1` requests directly.
+* Per-VPC isolation with the Proxmox firewall (IPSet and security group per VPC,
+  default deny, `ipfilter`) and Flash VIP integration.
+* Console access (noVNC/serial), snapshots, and extra disks.
