@@ -143,6 +143,10 @@ pub fn router(state: Shared) -> Router {
             post(termproxy),
         )
         .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces",
+            get(agent_interfaces),
+        )
+        .route(
             "/api2/json/nodes/{node}/qemu/{vmid}/vncwebsocket",
             get(vncwebsocket),
         )
@@ -255,6 +259,13 @@ async fn set_config(
         return err(StatusCode::INTERNAL_SERVER_ERROR, "VM is locked (clone)");
     }
     for (k, v) in form {
+        // Proxmox picks the MAC of a NIC given without one.
+        let v = match v.strip_prefix("virtio,") {
+            Some(rest) if k.starts_with("net") => {
+                format!("virtio=BC:24:11:EE:00:0{},{rest}", &k[3..])
+            }
+            _ => v,
+        };
         vm.config.insert(k, v);
     }
     s.calls.push(format!("set {vmid}"));
@@ -599,4 +610,35 @@ async fn vncwebsocket(
             }
         }
     })
+}
+
+/// What the guest agent reports: the address in the VM's `_agent_ip` test key, on its `net1` MAC.
+async fn agent_interfaces(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let s = s.lock().unwrap();
+    let Some(vm) = s.vms.get(&vmid) else {
+        return missing(vmid);
+    };
+    let (Some(ip), Some(net1)) = (vm.config.get("_agent_ip"), vm.config.get("net1")) else {
+        return err(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "QEMU guest agent is not running",
+        );
+    };
+    let mac = net1
+        .split(',')
+        .next()
+        .and_then(|p| p.strip_prefix("virtio="))
+        .unwrap_or_default();
+    Json(json!({"data": {"result": [
+        {"name": "lo", "hardware-address": "00:00:00:00:00:00", "ip-addresses": [{"ip-address": "127.0.0.1", "ip-address-type": "ipv4", "prefix": 8}]},
+        {"name": "ens19", "hardware-address": mac, "ip-addresses": [{"ip-address": ip, "ip-address-type": "ipv4", "prefix": 24}]},
+    ]}}))
+    .into_response()
 }

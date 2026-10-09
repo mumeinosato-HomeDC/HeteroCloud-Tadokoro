@@ -80,6 +80,11 @@ async fn run() -> Result<()> {
             search_domain: config.search_domain.clone(),
             max_vms: config.max_vms,
             flash_snat: config.flash_snat_addresses.clone(),
+            external: config
+                .external_bridge
+                .clone()
+                .zip(config.external_network)
+                .map(|(bridge, network)| tadokoro::reconcile::External { bridge, network }),
         },
         flash,
         dns,

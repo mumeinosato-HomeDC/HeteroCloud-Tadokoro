@@ -51,6 +51,10 @@ spec:
             - { name: TADOKORO_GATEWAY, value: {{ .Values.vm.gateway | quote }} }
             - { name: TADOKORO_NAMESERVER, value: {{ .Values.vm.nameserver | quote }} }
             - { name: TADOKORO_SEARCH_DOMAIN, value: {{ .Values.vm.searchDomain | quote }} }
+            {{- if .Values.external.bridge }}
+            - { name: TADOKORO_EXTERNAL_BRIDGE, value: {{ .Values.external.bridge | quote }} }
+            - { name: TADOKORO_EXTERNAL_NETWORK, value: {{ required "external.network is required with external.bridge" .Values.external.network | quote }} }
+            {{- end }}
             - { name: TADOKORO_MAX_VMS, value: {{ .Values.vm.maxVms | quote }} }
             {{- if .Values.dns.enabled }}
             - { name: TADOKORO_DNS_SERVER, value: {{ required "dns.server is required" .Values.dns.server | quote }} }

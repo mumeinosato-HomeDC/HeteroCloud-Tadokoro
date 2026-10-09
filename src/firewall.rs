@@ -23,17 +23,23 @@ pub const FLASH_VIP_IPSET: &str = "flash-vip";
 /// VM-scoped IP set Proxmox uses for `ipfilter` on `net0`.
 pub const IPFILTER_IPSET: &str = "ipfilter-net0";
 
-/// Desired firewall options of the VM.
-pub const OPTIONS: [(&str, &str); 8] = [
-    ("enable", "1"),
-    ("policy_in", "DROP"),
-    ("policy_out", "DROP"),
-    ("ipfilter", "1"),
-    ("macfilter", "1"),
-    ("dhcp", "0"),
-    ("ndp", "0"),
-    ("radv", "0"),
-];
+/// VM-scoped IP set Proxmox uses for `ipfilter` on `net1` (the external NIC).
+pub const EXTERNAL_IPFILTER_IPSET: &str = "ipfilter-net1";
+
+/// Desired firewall options of the VM. DHCP is only let through when there is an
+/// external NIC that needs it.
+pub fn options(external: bool) -> [(&'static str, &'static str); 8] {
+    [
+        ("enable", "1"),
+        ("policy_in", "DROP"),
+        ("policy_out", "DROP"),
+        ("ipfilter", "1"),
+        ("macfilter", "1"),
+        ("dhcp", if external { "1" } else { "0" }),
+        ("ndp", "0"),
+        ("radv", "0"),
+    ]
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FwRule {

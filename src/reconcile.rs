@@ -77,6 +77,15 @@ pub struct Settings {
     pub max_vms: usize,
     /// Source addresses Flash traffic reaches VMs from.
     pub flash_snat: Vec<Ipv4Addr>,
+    /// Second NIC towards the outside world, if configured.
+    pub external: Option<External>,
+}
+
+#[derive(Clone, Debug)]
+pub struct External {
+    pub bridge: String,
+    /// Addresses the external router hands out; anything else a guest reports is ignored.
+    pub network: Ipv4Net,
 }
 
 pub struct Reconciler {
@@ -338,7 +347,7 @@ impl Reconciler {
             .join("\n")
     }
 
-    fn restart_needed(config: &VmConfig, spec: &VmSpec) -> bool {
+    fn restart_needed(&self, config: &VmConfig, spec: &VmSpec) -> bool {
         let keys_now = config
             .str("sshkeys")
             .map(|v| percent_decode(&v))
@@ -348,6 +357,12 @@ impl Reconciler {
             || config.str("ciuser").as_deref() != Some(spec.username.as_str())
             || keys_now.trim() != Self::desired_sshkeys(spec).trim()
             || !has_firewall_flag(config)
+            // The external NIC is added (or its bridge changed) at the next boot.
+            || self
+                .settings
+                .external
+                .as_ref()
+                .is_some_and(|external| nic_bridge(config, "net1").as_deref() != Some(&external.bridge))
     }
 
     fn tags_for(ip: Ipv4Addr, vpc: Option<Uuid>) -> String {
@@ -411,7 +426,7 @@ impl Reconciler {
     ) -> Result<(), ReconcileError> {
         let vmid = vm.vmid;
         let spec = meta.spec.clone();
-        if power != "stopped" && Self::restart_needed(config, &spec) {
+        if power != "stopped" && self.restart_needed(config, &spec) {
             // CPU, memory, cloud-init and NIC changes apply on the next boot.
             self.pve.shutdown(vmid, SHUTDOWN_TIMEOUT_SECONDS).await?;
             return Ok(());
@@ -436,10 +451,14 @@ impl Reconciler {
             ),
             (
                 "ipconfig0",
-                format!(
-                    "ip={ip}/{},gw={}",
-                    self.settings.network_prefix, self.settings.gateway
-                ),
+                // With an external NIC the default route comes from its DHCP lease.
+                match self.settings.external {
+                    Some(_) => format!("ip={ip}/{}", self.settings.network_prefix),
+                    None => format!(
+                        "ip={ip}/{},gw={}",
+                        self.settings.network_prefix, self.settings.gateway
+                    ),
+                },
             ),
             ("nameserver", self.settings.nameserver.to_string()),
             ("searchdomain", self.settings.search_domain.clone()),
@@ -448,6 +467,15 @@ impl Reconciler {
         ];
         if let Some(net0) = net0_with_firewall(config) {
             params.push(("net0", net0));
+        }
+        if let Some(external) = &self.settings.external {
+            params.push(("ipconfig1", "ip=dhcp".into()));
+            if nic_bridge(config, "net1").as_deref() != Some(&external.bridge) {
+                params.push((
+                    "net1",
+                    format!("virtio,bridge={},firewall=1", external.bridge),
+                ));
+            }
         }
         // Firewall objects first, config last: a VM never boots unfiltered.
         self.ensure_firewall(vmid, &spec, ip).await?;
@@ -547,6 +575,9 @@ impl Reconciler {
     ) -> Result<(), ReconcileError> {
         self.set_ipset(vmid, IPFILTER_IPSET, &BTreeSet::from([ip.to_string()]))
             .await?;
+        if self.settings.external.is_some() {
+            self.ensure_external_ipfilter(vmid).await?;
+        }
         if spec.network.vpc_id.is_none() {
             self.set_ipset(vmid, VPC_IPSET, &BTreeSet::new()).await?;
         } else {
@@ -606,7 +637,7 @@ impl Reconciler {
         }
 
         let options = self.pve.fw_options(vmid).await?;
-        let changed: Vec<(&str, String)> = firewall::OPTIONS
+        let changed: Vec<(&str, String)> = firewall::options(self.settings.external.is_some())
             .iter()
             .filter(|(key, want)| options.str(key).as_deref() != Some(*want))
             .map(|(key, want)| (*key, (*want).to_owned()))
@@ -615,6 +646,68 @@ impl Reconciler {
             self.pve.set_fw_options(vmid, &changed).await?;
         }
         Ok(())
+    }
+
+    /// The address the external router leased to the VM's second NIC, as the guest agent reports
+    /// it. Only addresses inside the external network count; the guest controls what it says.
+    async fn external_ip(
+        &self,
+        vmid: u32,
+        config: &VmConfig,
+    ) -> Result<Option<Ipv4Addr>, ReconcileError> {
+        let Some(external) = &self.settings.external else {
+            return Ok(None);
+        };
+        let Some(mac) = nic_mac(config, "net1") else {
+            return Ok(None);
+        };
+        let interfaces = self.pve.agent_interfaces(vmid).await?;
+        Ok(interfaces
+            .iter()
+            .filter(|nic| {
+                nic.get("hardware-address")
+                    .and_then(Value::as_str)
+                    .is_some_and(|m| m.eq_ignore_ascii_case(&mac))
+            })
+            .flat_map(|nic| {
+                nic.get("ip-addresses")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+            })
+            .filter(|a| a.get("ip-address-type").and_then(Value::as_str) == Some("ipv4"))
+            .filter_map(|a| {
+                a.get("ip-address")
+                    .and_then(Value::as_str)?
+                    .parse::<Ipv4Addr>()
+                    .ok()
+            })
+            .find(|ip| external.network.contains(ip)))
+    }
+
+    /// Lets the leased external address through `ipfilter` (the lease is unknown until the guest has
+    /// booted, so the set starts empty and is filled from the next sync). Without information the
+    /// current set is left alone.
+    async fn ensure_external_ipfilter(&self, vmid: u32) -> Result<(), ReconcileError> {
+        let config = match self.pve.config(vmid).await {
+            Ok(config) => config,
+            Err(PveError::NotFound | PveError::Locked) => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        match self.external_ip(vmid, &config).await? {
+            Some(ip) => {
+                self.set_ipset(
+                    vmid,
+                    firewall::EXTERNAL_IPFILTER_IPSET,
+                    &BTreeSet::from([ip.to_string()]),
+                )
+                .await
+            }
+            None => {
+                self.ensure_ipset(vmid, firewall::EXTERNAL_IPFILTER_IPSET)
+                    .await
+            }
+        }
     }
 
     async fn ensure_ipset(&self, vmid: u32, name: &str) -> Result<(), ReconcileError> {
@@ -740,7 +833,9 @@ impl Reconciler {
             self.ensure_firewall(vm.vmid, &meta.spec, ip).await?;
         }
         match (power, meta.spec.stopped) {
-            ("running", false) | ("stopped", true) => Ok(self.status_json(vm, config, meta, power)),
+            ("running", false) | ("stopped", true) => {
+                Ok(self.status_json(vm, config, meta, power).await)
+            }
             ("stopped", false) => {
                 self.pve.start(vm.vmid).await?;
                 Err(ReconcileError::NotReady)
@@ -773,7 +868,18 @@ impl Reconciler {
             .collect()
     }
 
-    fn status_json(&self, vm: &PveVm, config: &VmConfig, meta: &VmMeta, power: &str) -> Value {
+    async fn status_json(
+        &self,
+        vm: &PveVm,
+        config: &VmConfig,
+        meta: &VmMeta,
+        power: &str,
+    ) -> Value {
+        let external_ip = if power == "running" {
+            self.external_ip(vm.vmid, config).await.ok().flatten()
+        } else {
+            None
+        };
         json!({
             "phase": "ready",
             "observed_generation": meta.applied_generation,
@@ -781,6 +887,7 @@ impl Reconciler {
             "node": vm.node,
             "hostname": vm.name,
             "ip_address": Self::ip_of(config).map(|ip| ip.to_string()),
+            "external_ip_address": external_ip.map(|ip| ip.to_string()),
             "power_state": power,
             "image": meta.spec.image,
             "cpu_cores": meta.spec.cpu_cores,
@@ -889,12 +996,29 @@ impl Reconciler {
             return Err(ReconcileError::NotReady);
         }
         let power = self.pve.power_state(vm.vmid).await?;
-        Ok(self.status_json(&vm, &config, &meta, &power))
+        Ok(self.status_json(&vm, &config, &meta, &power).await)
     }
 }
 
 fn vpc_tag(vpc: Uuid) -> String {
     format!("hc-vpc-{}", vpc.simple())
+}
+
+/// `bridge=` of a NIC, e.g. `net1`.
+fn nic_bridge(config: &VmConfig, nic: &str) -> Option<String> {
+    config
+        .str(nic)?
+        .split(',')
+        .find_map(|part| part.strip_prefix("bridge=").map(str::to_owned))
+}
+
+/// MAC address of a NIC (`virtio=BC:24:...`).
+fn nic_mac(config: &VmConfig, nic: &str) -> Option<String> {
+    config.str(nic)?.split(',').find_map(|part| {
+        part.split_once('=')
+            .filter(|(model, _)| *model == "virtio")
+            .map(|(_, mac)| mac.to_owned())
+    })
 }
 
 fn has_firewall_flag(config: &VmConfig) -> bool {
