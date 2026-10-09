@@ -202,15 +202,7 @@ token secret is mounted from a Kubernetes Secret and never logged.
   dispatch, IAM actions `vm:*`, CLI and console). Until then the provider is driven
   by signed `provider/v1` requests directly.
 * Per-VPC source addresses for Flash → VM traffic (see the limitation above).
-* Console access (noVNC/serial), snapshots, and extra disks.
-
-## Web shell
-
-`GET /internal/v1/service-instances/{id}/shell` (action `vm.shell`, WebSocket) relays a browser terminal to the VM's
-serial console through Proxmox `termproxy` + `vncwebsocket`. Binary frames are keystrokes, `{"type":"resize"}` text
-frames resize the pty; output comes back as binary frames. Requires a running, applied VM and the `VM.Console`
-privilege on the Tadokoro role. Concurrent sessions are capped (16). The template's `serial-getty@ttyS0` auto-logs in
-as the default user because access is already authorized by HeteroCloud IAM (`vm:ExecInstance`).
+* Snapshots, and extra disks.
 
 ## External NIC
 
@@ -228,3 +220,11 @@ NIC takes effect at the next boot, like other NIC changes.
 - The lease is exposed as `external_ip_address` in the status.
 - Lab: `scripts/pve-external-setup.sh` creates a node-local SDN simple zone with SNAT and dnsmasq DHCP that stands
   in for the router (uplink: the node's own gateway).
+
+## Graphical console
+
+`GET /internal/v1/service-instances/{id}/console` (action `vm.console`, WebSocket) relays the Proxmox VNC proxy
+(`vncproxy` + `vncwebsocket`). Proxmox protects it with the proxy ticket as the VNC password. The relay answers the
+RFB "VNC authentication" challenge itself (DES with the ticket) and offers the browser security type "None", so the
+ticket never leaves the provider; afterwards the RFB stream is relayed unchanged. VMs get `vga: std` (applied at the
+next boot). Open consoles are capped (16). There is deliberately no serial console: it is one shared stream with one shared login.
