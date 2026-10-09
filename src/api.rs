@@ -14,8 +14,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::{
-    PROVIDER_DELETE_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_SHELL_ACTION,
-    PROVIDER_STATUS_GET_ACTION,
+    PROVIDER_DELETE_ACTION, PROVIDER_RECONCILE_ACTION, PROVIDER_STATUS_GET_ACTION,
     auth::{AuthError, ProviderAuthenticator, ProviderClaims},
     pve::PveError,
     reconcile::{ReconcileError, Reconciler},
@@ -32,10 +31,6 @@ pub struct AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route(
-            "/internal/v1/service-instances/{service_instance_id}/shell",
-            get(shell),
-        )
         .route(
             "/internal/v1/service-instances/{service_instance_id}/console",
             get(console),
@@ -163,33 +158,6 @@ async fn remove(
     ))
 }
 
-async fn shell(
-    State(state): State<Arc<AppState>>,
-    Path(service_instance_id): Path<Uuid>,
-    Query(query): Query<GenerationQuery>,
-    headers: HeaderMap,
-    upgrade: WebSocketUpgrade,
-) -> Result<Response, ApiError> {
-    let claims = state
-        .authenticator
-        .authenticate(&headers, PROVIDER_SHELL_ACTION)?;
-    validate_command(&claims, service_instance_id, query.generation)?;
-    let permit = Arc::clone(&state.shell_sessions)
-        .try_acquire_owned()
-        .map_err(|_| ApiError::TooManySessions)?;
-    let vmid = state
-        .reconciler
-        .shell_target(&claims, query.generation)
-        .await?;
-    let (pve_socket, proxy) = state.reconciler.open_terminal(vmid).await?;
-    Ok(upgrade
-        .max_message_size(64 * 1024)
-        .on_upgrade(move |browser| async move {
-            crate::shell::bridge(browser, pve_socket, proxy).await;
-            drop(permit);
-        }))
-}
-
 async fn console(
     State(state): State<Arc<AppState>>,
     Path(service_instance_id): Path<Uuid>,
@@ -206,7 +174,7 @@ async fn console(
         .map_err(|_| ApiError::TooManySessions)?;
     let vmid = state
         .reconciler
-        .shell_target(&claims, query.generation)
+        .console_target(&claims, query.generation)
         .await?;
     let (pve_socket, ticket) = state.reconciler.open_console(vmid).await?;
     Ok(upgrade

@@ -15,7 +15,7 @@ use des::{
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message as Pve;
 
-use crate::pve::TerminalSocket;
+use crate::pve::VncSocket;
 
 const MAX_SESSION: Duration = Duration::from_secs(4 * 60 * 60);
 const SECURITY_NONE: u8 = 1;
@@ -102,7 +102,7 @@ where
     (from_pve.take(4).await? == [0, 0, 0, 0]).then_some(())
 }
 
-pub async fn bridge(browser: WebSocket, pve: TerminalSocket, ticket: &str) {
+pub async fn bridge(browser: WebSocket, pve: VncSocket, ticket: &str) {
     let (mut to_pve, from_pve) = pve.split();
     let mut from_pve = Reader {
         stream: from_pve,

@@ -33,15 +33,14 @@ pub struct PveClient {
     ca_pem: Option<Vec<u8>>,
 }
 
-/// A WebSocket to the Proxmox serial terminal proxy.
-pub type TerminalSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
+/// A WebSocket to the Proxmox VNC proxy.
+pub type VncSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-/// What `termproxy` hands out: the one-time credentials for the terminal socket.
+/// What `vncproxy` hands out: the one-time credentials for the console socket.
 #[derive(Clone, Debug)]
-pub struct TermProxy {
+pub struct VncProxy {
     pub port: u16,
     pub ticket: String,
-    pub user: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -426,30 +425,8 @@ impl PveClient {
         }
     }
 
-    /// Starts a serial terminal proxy for the VM and returns its one-time credentials.
-    pub async fn termproxy(&self, vmid: u32) -> Result<TermProxy, PveError> {
-        let data = self
-            .call(Method::POST, &self.qemu(vmid, "/termproxy"), &[])
-            .await?;
-        let field = |name: &str| data.get(name).cloned().unwrap_or(Value::Null);
-        let port = field("port")
-            .as_u64()
-            .or_else(|| field("port").as_str().and_then(|p| p.parse().ok()))
-            .and_then(|p| u16::try_from(p).ok());
-        match (port, field("ticket").as_str(), field("user").as_str()) {
-            (Some(port), Some(ticket), Some(user)) => Ok(TermProxy {
-                port,
-                ticket: ticket.to_owned(),
-                user: user.to_owned(),
-            }),
-            _ => Err(PveError::Unavailable(
-                "unexpected termproxy response".into(),
-            )),
-        }
-    }
-
     /// Starts a VNC proxy (the graphical console) for the VM; the ticket is also the VNC password.
-    pub async fn vncproxy(&self, vmid: u32) -> Result<TermProxy, PveError> {
+    pub async fn vncproxy(&self, vmid: u32) -> Result<VncProxy, PveError> {
         let data = self
             .call(
                 Method::POST,
@@ -463,21 +440,16 @@ impl PveClient {
             .or_else(|| field("port").as_str().and_then(|p| p.parse().ok()))
             .and_then(|p| u16::try_from(p).ok());
         match (port, field("ticket").as_str()) {
-            (Some(port), Some(ticket)) => Ok(TermProxy {
+            (Some(port), Some(ticket)) => Ok(VncProxy {
                 port,
                 ticket: ticket.to_owned(),
-                user: String::new(),
             }),
             _ => Err(PveError::Unavailable("unexpected vncproxy response".into())),
         }
     }
 
-    /// Connects to the terminal proxy started by [`Self::termproxy`].
-    pub async fn connect_terminal(
-        &self,
-        vmid: u32,
-        proxy: &TermProxy,
-    ) -> Result<TerminalSocket, PveError> {
+    /// Connects to the VNC proxy started by [`Self::vncproxy`].
+    pub async fn connect_vnc(&self, vmid: u32, proxy: &VncProxy) -> Result<VncSocket, PveError> {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let ws_base = self
             .base_url

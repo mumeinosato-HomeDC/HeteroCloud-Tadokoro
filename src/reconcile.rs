@@ -944,9 +944,9 @@ impl Reconciler {
         Err(ReconcileError::NotReady)
     }
 
-    /// Verifies the caller may open a shell on this VM and returns its VMID: same tenant,
+    /// Verifies the caller may open the console of this VM and returns its VMID: same tenant,
     /// current generation, configured and running.
-    pub async fn shell_target(
+    pub async fn console_target(
         &self,
         claims: &ProviderClaims,
         generation: i64,
@@ -974,19 +974,10 @@ impl Reconciler {
     pub async fn open_console(
         &self,
         vmid: u32,
-    ) -> Result<(crate::pve::TerminalSocket, String), ReconcileError> {
+    ) -> Result<(crate::pve::VncSocket, String), ReconcileError> {
         let proxy = self.pve.vncproxy(vmid).await?;
-        let socket = self.pve.connect_terminal(vmid, &proxy).await?;
+        let socket = self.pve.connect_vnc(vmid, &proxy).await?;
         Ok((socket, proxy.ticket))
-    }
-
-    pub async fn open_terminal(
-        &self,
-        vmid: u32,
-    ) -> Result<(crate::pve::TerminalSocket, crate::pve::TermProxy), ReconcileError> {
-        let proxy = self.pve.termproxy(vmid).await?;
-        let socket = self.pve.connect_terminal(vmid, &proxy).await?;
-        Ok((socket, proxy))
     }
 
     pub async fn status(

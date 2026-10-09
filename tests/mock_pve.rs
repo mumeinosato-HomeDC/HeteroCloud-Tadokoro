@@ -139,10 +139,6 @@ pub fn router(state: Shared) -> Router {
             axum::routing::delete(delete_ipset_entry),
         )
         .route(
-            "/api2/json/nodes/{node}/qemu/{vmid}/termproxy",
-            post(termproxy),
-        )
-        .route(
             "/api2/json/nodes/{node}/qemu/{vmid}/vncproxy",
             post(vncproxy),
         )
@@ -549,32 +545,8 @@ async fn delete_ipset_entry(
     Json(json!({"data": null})).into_response()
 }
 
-pub const TERM_USER: &str = "tadokoro@pve!provider";
-pub const TERM_TICKET: &str = "PVEVNC:5F000000::mock+ticket/with=odd+chars";
-
-async fn termproxy(
-    State(s): State<Shared>,
-    Path((_n, vmid)): Path<(String, u32)>,
-    headers: HeaderMap,
-) -> Response {
-    if !authorized(&headers) {
-        return err(StatusCode::UNAUTHORIZED, "no ticket");
-    }
-    let mut s = s.lock().unwrap();
-    let Some(vm) = s.vms.get(&vmid) else {
-        return missing(vmid);
-    };
-    if vm.status != "running" {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, "VM is not running");
-    }
-    s.calls.push(format!("termproxy {vmid}"));
-    Json(json!({"data": {"port": "5900", "ticket": TERM_TICKET, "user": TERM_USER, "upid": "UPID:termproxy"}})).into_response()
-}
-
-/// Speaks the termproxy protocol: auth line, "OK", then echoes input as output.
 async fn vncwebsocket(
-    State(s): State<Shared>,
-    Path((_n, vmid)): Path<(String, u32)>,
+    Path((_n, _vmid)): Path<(String, u32)>,
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
@@ -582,43 +554,12 @@ async fn vncwebsocket(
     if !authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "no ticket");
     }
-    let port = q.get("port").map(String::as_str);
-    let ticket = q.get("vncticket").map(String::as_str);
-    let terminal = port == Some("5900") && ticket == Some(TERM_TICKET);
-    let graphical = port == Some("5901") && ticket == Some(VNC_TICKET);
-    if !terminal && !graphical {
+    if q.get("port").map(String::as_str) != Some("5901")
+        || q.get("vncticket").map(String::as_str) != Some(VNC_TICKET)
+    {
         return err(StatusCode::FORBIDDEN, "bad ticket");
     }
-    if graphical {
-        return upgrade.on_upgrade(rfb_server);
-    }
-    upgrade.on_upgrade(move |mut socket: WebSocket| async move {
-        let Some(Ok(WsMessage::Text(auth))) = socket.recv().await else {
-            return;
-        };
-        if auth.as_str() != format!("{TERM_USER}:{TERM_TICKET}\n") {
-            return;
-        }
-        let _ = socket.send(WsMessage::Text("OK".into())).await;
-        while let Some(Ok(message)) = socket.recv().await {
-            let WsMessage::Text(text) = message else {
-                continue;
-            };
-            let text = text.as_str();
-            if let Some(rest) = text.strip_prefix("0:") {
-                let (len, data) = rest.split_once(':').unwrap_or(("0", ""));
-                assert_eq!(len.parse::<usize>().unwrap(), data.len());
-                let _ = socket
-                    .send(WsMessage::Text(format!("echo:{data}").into()))
-                    .await;
-            } else if let Some(rest) = text.strip_prefix("1:") {
-                s.lock().unwrap().calls.push(format!(
-                    "resize {vmid} {}",
-                    rest.trim_end_matches(':').replace(':', "x")
-                ));
-            }
-        }
-    })
+    upgrade.on_upgrade(rfb_server)
 }
 
 /// What the guest agent reports: the address in the VM's `_agent_ip` test key, on its `net1` MAC.
@@ -670,7 +611,7 @@ async fn vncproxy(
         return err(StatusCode::INTERNAL_SERVER_ERROR, "VM is not running");
     }
     s.calls.push(format!("vncproxy {vmid}"));
-    Json(json!({"data": {"port": "5901", "ticket": VNC_TICKET, "user": TERM_USER}})).into_response()
+    Json(json!({"data": {"port": "5901", "ticket": VNC_TICKET}})).into_response()
 }
 
 async fn rfb_need(socket: &mut WebSocket, buffer: &mut Vec<u8>, count: usize) -> Option<Vec<u8>> {
