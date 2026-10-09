@@ -44,6 +44,13 @@ flash:
   snatAddresses: []
   syncSeconds: 30
 
+# Second NIC towards the outside world. Every VM gets one on `bridge` and takes its address and
+# default route from the router that serves it (DHCP); the VPC NIC keeps no gateway. Empty:
+# VMs have the VPC NIC only. `network` is the range that router leases from.
+external:
+  bridge: ""
+  network: ""
+
 # Registers names for VMs and the VM-facing addresses of Flash services through RFC 2136.
 dns:
   enabled: false

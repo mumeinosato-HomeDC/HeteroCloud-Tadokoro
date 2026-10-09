@@ -211,3 +211,20 @@ serial console through Proxmox `termproxy` + `vncwebsocket`. Binary frames are k
 frames resize the pty; output comes back as binary frames. Requires a running, applied VM and the `VM.Console`
 privilege on the Tadokoro role. Concurrent sessions are capped (16). The template's `serial-getty@ttyS0` auto-logs in
 as the default user because access is already authorized by HeteroCloud IAM (`vm:ExecInstance`).
+
+## External NIC
+
+With `TADOKORO_EXTERNAL_BRIDGE` / `TADOKORO_EXTERNAL_NETWORK` set, every VM gets a second NIC (`net1`) on that
+bridge, configured by DHCP. The router that serves the bridge decides the address and the default route; the VPC
+NIC (`net0`) keeps its Tadokoro-assigned address but no gateway, so internet traffic leaves via `net1`. Changing the
+NIC takes effect at the next boot, like other NIC changes.
+
+- Ingress/egress rules are per VM and apply to both NICs. The firewall option `dhcp` is on only when an external
+  NIC exists.
+- `ipfilter` needs the leased address: the guest agent reports it and the periodic sync writes it into
+  `ipfilter-net1`. Only addresses inside `TADOKORO_EXTERNAL_NETWORK` are accepted (the guest controls what it
+  reports), and until a lease is known nothing is allowed out of `net1`. A guest could still claim a neighbour's
+  address inside that range; the external router should do its own anti-spoofing.
+- The lease is exposed as `external_ip_address` in the status.
+- Lab: `scripts/pve-external-setup.sh` creates a node-local SDN simple zone with SNAT and dnsmasq DHCP that stands
+  in for the router (uplink: the node's own gateway).

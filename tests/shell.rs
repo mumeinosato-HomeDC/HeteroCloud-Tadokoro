@@ -81,6 +81,7 @@ async fn env(sessions: usize) -> Env {
             search_domain: "hetero.internal".into(),
             max_vms: 4,
             flash_snat: vec![],
+            external: None,
         },
         None,
         None,
