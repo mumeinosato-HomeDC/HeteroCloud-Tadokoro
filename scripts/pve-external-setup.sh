@@ -8,6 +8,7 @@
 # at the bridge or VLAN that the real router serves.
 #
 # usage: pve-external-setup.sh [NODE] [ZONE] [SUBNET] [GATEWAY] [DHCP_START] [DHCP_END]
+# env: PVE_USER (default tadokoro@pve), PVE_ROLE (default HCTadokoro), DHCP range via arguments
 set -euo pipefail
 
 node=${1:-pve02}
@@ -36,4 +37,6 @@ fi
 echo "net.ipv4.ip_forward = 1" >/etc/sysctl.d/90-hcext-forward.conf
 sysctl -w net.ipv4.ip_forward=1 >/dev/null
 pvesh set /cluster/sdn
+# Tadokoro attaches VMs to the zone, which needs SDN.Use on it.
+pveum acl modify "/sdn/zones/$zone" --users "${PVE_USER:-tadokoro@pve}" --roles "${PVE_ROLE:-HCTadokoro}"
 echo "external zone $zone ready on $node ($subnet via $gateway)"
