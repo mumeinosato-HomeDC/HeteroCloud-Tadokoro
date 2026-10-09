@@ -58,6 +58,14 @@ pub struct Config {
     /// VM network bridge (the SDN VNet).
     #[arg(long, env = "TADOKORO_BRIDGE", default_value = "hcnet")]
     pub bridge: String,
+    /// Bridge of the external network: every VM gets a second NIC there and takes its address
+    /// (and default route) from whatever router serves it via DHCP. Unset: no external NIC.
+    #[arg(long, env = "TADOKORO_EXTERNAL_BRIDGE")]
+    pub external_bridge: Option<String>,
+    /// Address range of the external network. A VM's external address (read from the guest
+    /// agent) is only trusted if it lies in here.
+    #[arg(long, env = "TADOKORO_EXTERNAL_NETWORK")]
+    pub external_network: Option<Ipv4Net>,
     /// Addresses handed to VMs. Network and broadcast addresses are skipped.
     #[arg(long, env = "TADOKORO_IP_POOL", default_value = "10.100.16.0/20")]
     pub ip_pool: Ipv4Net,
@@ -121,6 +129,9 @@ impl Config {
         }
         if self.ip_pool.prefix_len() > 29 {
             bail!("the IP pool is too small");
+        }
+        if self.external_bridge.is_some() != self.external_network.is_some() {
+            bail!("the external bridge and the external network go together");
         }
         if self.max_vms == 0 {
             bail!("max VMs must be positive");

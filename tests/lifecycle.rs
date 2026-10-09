@@ -71,6 +71,10 @@ async fn serve_kube(vips: Vips) -> String {
 }
 
 async fn harness(max_vms: usize) -> Harness {
+    harness_with(max_vms, None).await
+}
+
+async fn harness_with(max_vms: usize, external: Option<tadokoro::reconcile::External>) -> Harness {
     let pve = new_state();
     let url = serve(pve.clone()).await;
     let vips = Arc::new(std::sync::Mutex::new(Some(Vec::new())));
@@ -95,6 +99,7 @@ async fn harness(max_vms: usize) -> Harness {
             search_domain: "hetero.internal".into(),
             max_vms,
             flash_snat: vec![Ipv4Addr::new(10, 100, 0, 10)],
+            external,
         },
         Some(FlashDirectory::new(&kube_url, "flash-workloads", "token", None).unwrap()),
         None,
@@ -826,4 +831,61 @@ async fn periodic_sync_repairs_firewall_rules_of_settled_vms() {
         .clear();
     h.reconciler.sync_all().await.unwrap();
     assert_eq!(vm_of(&h, instance).1.fw_rules.len(), 2, "dns tcp+udp only");
+}
+
+#[tokio::test]
+async fn vms_get_an_external_nic_whose_lease_is_allowed_through_ipfilter() {
+    let h = harness_with(
+        8,
+        Some(tadokoro::reconcile::External {
+            bridge: "hcext".into(),
+            network: "10.101.0.0/24".parse().unwrap(),
+        }),
+    )
+    .await;
+    let instance = Uuid::now_v7();
+    converge(&h, instance, 1, "ext", spec_with(json!({}))).await;
+    let (vmid, vm) = vm_of(&h, instance);
+    assert!(vm.config["net1"].contains("bridge=hcext") && vm.config["net1"].contains("firewall=1"));
+    assert_eq!(vm.config["ipconfig1"], "ip=dhcp");
+    assert!(
+        !vm.config["ipconfig0"].contains("gw="),
+        "the default route comes from the external lease"
+    );
+    assert_eq!(vm.fw_options.get("dhcp").map(String::as_str), Some("1"));
+    assert!(
+        ipset(&h, instance, "ipfilter-net1").is_empty(),
+        "no lease is known before boot"
+    );
+
+    // The guest reports a lease; addresses outside the external network are not believed.
+    let agent = |ip: &str| {
+        h.pve
+            .lock()
+            .unwrap()
+            .vms
+            .get_mut(&vmid)
+            .unwrap()
+            .config
+            .insert("_agent_ip".into(), ip.into());
+    };
+    agent("10.100.16.99");
+    h.reconciler.sync_all().await.unwrap();
+    assert!(ipset(&h, instance, "ipfilter-net1").is_empty());
+    agent("10.101.0.77");
+    h.reconciler.sync_all().await.unwrap();
+    assert_eq!(ipset(&h, instance, "ipfilter-net1"), vec!["10.101.0.77"]);
+
+    let t = token(&h, instance, "vm.status.get", 1, "heterocloud-vm");
+    let (_, status) = send(
+        &h,
+        Request::get(format!(
+            "/internal/v1/service-instances/{instance}?generation=1"
+        ))
+        .header("authorization", format!("Bearer {t}"))
+        .body(Body::empty())
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status["external_ip_address"], "10.101.0.77");
 }

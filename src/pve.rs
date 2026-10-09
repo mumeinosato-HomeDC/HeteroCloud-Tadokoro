@@ -407,6 +407,26 @@ impl PveClient {
     }
 
     /// Starts a serial terminal proxy for the VM and returns its one-time credentials.
+    /// Network interfaces as the guest agent sees them; empty while the agent is not running.
+    pub async fn agent_interfaces(&self, vmid: u32) -> Result<Vec<Value>, PveError> {
+        match self
+            .call(
+                Method::GET,
+                &self.qemu(vmid, "/agent/network-get-interfaces"),
+                &[],
+            )
+            .await
+        {
+            Ok(data) => Ok(data
+                .get("result")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()),
+            Err(PveError::Rejected { .. } | PveError::Unavailable(_)) => Ok(Vec::new()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn termproxy(&self, vmid: u32) -> Result<TermProxy, PveError> {
         let data = self
             .call(Method::POST, &self.qemu(vmid, "/termproxy"), &[])
