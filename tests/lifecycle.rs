@@ -509,8 +509,10 @@ async fn firewall_is_enforced_before_the_vm_starts() {
         );
     }
     assert_eq!(vm.ipsets["ipfilter-net0"], vec!["10.100.16.1".to_owned()]);
-    // ssh in, dns udp+tcp, drop private, accept the rest.
-    assert_eq!(vm.fw_rules.len(), 5);
+    // ssh in, dns udp+tcp, the ssh reply, drop private, accept the rest.
+    assert_eq!(vm.fw_rules.len(), 6);
+    assert_eq!(vm.fw_rules[3]["sport"], "22", "answers to the allowed source may leave");
+    assert_eq!(vm.fw_rules[3]["dest"], "10.0.128.0/24");
     assert_eq!(vm.fw_rules[0]["type"], "in");
     assert_eq!(vm.fw_rules[0]["dport"], "22");
     assert_eq!(vm.fw_rules[0]["source"], "10.0.128.0/24");
