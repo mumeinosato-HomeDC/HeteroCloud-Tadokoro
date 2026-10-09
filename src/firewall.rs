@@ -48,6 +48,7 @@ pub struct FwRule {
     pub action: &'static str,
     pub proto: Option<&'static str>,
     pub dport: Option<String>,
+    pub sport: Option<String>,
     pub source: Option<String>,
     pub dest: Option<String>,
 }
@@ -64,6 +65,7 @@ impl FwRule {
             action,
             proto,
             dport: dport.map(str::to_owned),
+            sport: None,
             source: None,
             dest,
         }
@@ -80,6 +82,7 @@ impl FwRule {
         for (key, value) in [
             ("proto", self.proto.map(str::to_owned)),
             ("dport", self.dport.clone()),
+            ("sport", self.sport.clone()),
             ("source", self.source.clone()),
             ("dest", self.dest.clone()),
         ] {
@@ -103,6 +106,7 @@ impl FwRule {
             && field("action").as_deref() == Some(self.action)
             && field("proto").as_deref() == self.proto
             && field("dport") == self.dport
+            && field("sport") == self.sport
             && field("source") == self.source
             && field("dest") == self.dest
             && field("comment").as_deref() == Some(COMMENT)
@@ -145,6 +149,7 @@ pub fn rules(spec: &VmSpec, nameserver: Ipv4Addr) -> Vec<FwRule> {
                 action: "ACCEPT",
                 proto: None,
                 dport: None,
+                sport: None,
                 source: Some(format!("+{set}")),
                 dest: None,
             });
@@ -161,6 +166,7 @@ pub fn rules(spec: &VmSpec, nameserver: Ipv4Addr) -> Vec<FwRule> {
             action: "ACCEPT",
             proto: Some(proto),
             dport: rule.ports.as_deref().map(proxmox_ports),
+            sport: None,
             source: Some(join_cidrs(&rule.source_cidrs)),
             dest: None,
         });
@@ -174,6 +180,24 @@ pub fn rules(spec: &VmSpec, nameserver: Ipv4Addr) -> Vec<FwRule> {
             Some("53"),
             Some(nameserver.to_string()),
         ));
+    }
+    // Answers to allowed inbound connections. Connection tracking normally lets them out, but not
+    // for traffic that is routed to the VM (the external NIC): a source in a private range would
+    // otherwise run into the protected-network drop below.
+    for rule in &network.ingress {
+        let proto = match rule.protocol {
+            Protocol::Tcp => "tcp",
+            Protocol::Udp => "udp",
+            Protocol::Icmp => "icmp",
+        };
+        let mut reply = FwRule::out(
+            "ACCEPT",
+            Some(proto),
+            None,
+            Some(join_cidrs(&rule.source_cidrs)),
+        );
+        reply.sport = rule.ports.as_deref().map(proxmox_ports);
+        rules.push(reply);
     }
     if network.vpc_id.is_some() {
         for set in [VPC_IPSET, FLASH_VIP_IPSET] {
@@ -290,6 +314,9 @@ mod tests {
                 "in ACCEPT icmp - 10.0.128.0/24 -",
                 "out ACCEPT udp 53 - 10.100.0.2",
                 "out ACCEPT tcp 53 - 10.100.0.2",
+                "out ACCEPT tcp - - 10.0.128.0/24,192.0.2.7",
+                "out ACCEPT udp - - 0.0.0.0/0",
+                "out ACCEPT icmp - - 10.0.128.0/24",
                 "out ACCEPT - - - +vpc",
                 "out ACCEPT - - - +flash-vip",
                 "out DROP - - - 198.51.100.128/25",
