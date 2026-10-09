@@ -468,6 +468,10 @@ impl Reconciler {
         if let Some(net0) = net0_with_firewall(config) {
             params.push(("net0", net0));
         }
+        if config.str("vga").as_deref() != Some("std") {
+            // The graphical console needs a display; the serial console stays (serial0).
+            params.push(("vga", "std".into()));
+        }
         if let Some(external) = &self.settings.external {
             params.push(("ipconfig1", "ip=dhcp".into()));
             if nic_bridge(config, "net1").as_deref() != Some(&external.bridge) {
@@ -964,6 +968,16 @@ impl Reconciler {
             return Err(ReconcileError::NotReady);
         }
         Ok(vm.vmid)
+    }
+
+    /// Opens the graphical (VNC) console; the returned ticket is the VNC password.
+    pub async fn open_console(
+        &self,
+        vmid: u32,
+    ) -> Result<(crate::pve::TerminalSocket, String), ReconcileError> {
+        let proxy = self.pve.vncproxy(vmid).await?;
+        let socket = self.pve.connect_terminal(vmid, &proxy).await?;
+        Ok((socket, proxy.ticket))
     }
 
     pub async fn open_terminal(

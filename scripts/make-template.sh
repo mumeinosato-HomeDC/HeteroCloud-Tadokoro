@@ -45,7 +45,7 @@ YAML
 
 # mtu=1 follows the bridge MTU; the VXLAN underlay is smaller than 1500.
 qm create "$vmid" --name "$name" --memory 2048 --cores 2 --cpu host --ostype l26 --agent 1 \
-  --scsihw virtio-scsi-single --net0 "virtio,bridge=$bridge,mtu=1" --serial0 socket --vga serial0 \
+  --scsihw virtio-scsi-single --net0 "virtio,bridge=$bridge,mtu=1" --serial0 socket --vga std \
   --scsi0 "$storage:0,import-from=$image,discard=on,iothread=1" --ide2 "$storage:cloudinit" \
   --boot order=scsi0
 qm set "$vmid" --ciuser ubuntu --sshkeys "$pubkey" --ipconfig0 "ip=$prep_ip,gw=$gateway" \

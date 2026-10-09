@@ -140,8 +140,17 @@ fn shell_request(
     action: &str,
     generation: i64,
 ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
+    shell_request_for(e, "shell", action, generation)
+}
+
+fn shell_request_for(
+    e: &Env,
+    path: &str,
+    action: &str,
+    generation: i64,
+) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let url = format!(
-        "ws://{}/internal/v1/service-instances/{}/shell?generation={generation}",
+        "ws://{}/internal/v1/service-instances/{}/{path}?generation={generation}",
         e.addr, e.instance
     );
     let mut request = url.into_client_request().unwrap();
@@ -246,5 +255,57 @@ async fn open_shells_are_bounded() {
             .await
             .is_err(),
         "the second shell is refused"
+    );
+}
+
+#[tokio::test]
+async fn the_graphical_console_authenticates_for_the_browser() {
+    let e = env(4).await;
+    let (mut socket, _) =
+        tokio_tungstenite::connect_async(shell_request_for(&e, "console", "vm.console", 1))
+            .await
+            .unwrap();
+    async fn next(
+        socket: &mut (
+                 impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+                 + Unpin
+             ),
+    ) -> Vec<u8> {
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        message.into_data().to_vec()
+    }
+    assert_eq!(next(&mut socket).await, b"RFB 003.008\n");
+    socket
+        .send(Message::Binary(b"RFB 003.008\n".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut socket).await,
+        vec![1, 1],
+        "the browser is offered no authentication"
+    );
+    socket.send(Message::Binary(vec![1].into())).await.unwrap();
+    assert_eq!(next(&mut socket).await, vec![0, 0, 0, 0]);
+    // From here on the stream is relayed unchanged.
+    socket.send(Message::Binary(vec![1].into())).await.unwrap();
+    assert_eq!(next(&mut socket).await, b"SERVERINIT");
+}
+
+#[tokio::test]
+async fn the_console_needs_its_own_action() {
+    let e = env(4).await;
+    assert!(
+        tokio_tungstenite::connect_async(shell_request_for(&e, "console", "vm.shell", 1))
+            .await
+            .is_err()
+    );
+    assert!(
+        tokio_tungstenite::connect_async(shell_request_for(&e, "shell", "vm.console", 1))
+            .await
+            .is_err()
     );
 }

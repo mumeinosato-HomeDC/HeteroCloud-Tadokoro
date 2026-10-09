@@ -143,6 +143,10 @@ pub fn router(state: Shared) -> Router {
             post(termproxy),
         )
         .route(
+            "/api2/json/nodes/{node}/qemu/{vmid}/vncproxy",
+            post(vncproxy),
+        )
+        .route(
             "/api2/json/nodes/{node}/qemu/{vmid}/agent/network-get-interfaces",
             get(agent_interfaces),
         )
@@ -578,10 +582,15 @@ async fn vncwebsocket(
     if !authorized(&headers) {
         return err(StatusCode::UNAUTHORIZED, "no ticket");
     }
-    if q.get("port").map(String::as_str) != Some("5900")
-        || q.get("vncticket").map(String::as_str) != Some(TERM_TICKET)
-    {
+    let port = q.get("port").map(String::as_str);
+    let ticket = q.get("vncticket").map(String::as_str);
+    let terminal = port == Some("5900") && ticket == Some(TERM_TICKET);
+    let graphical = port == Some("5901") && ticket == Some(VNC_TICKET);
+    if !terminal && !graphical {
         return err(StatusCode::FORBIDDEN, "bad ticket");
+    }
+    if graphical {
+        return upgrade.on_upgrade(rfb_server);
     }
     upgrade.on_upgrade(move |mut socket: WebSocket| async move {
         let Some(Ok(WsMessage::Text(auth))) = socket.recv().await else {
@@ -641,4 +650,63 @@ async fn agent_interfaces(
         {"name": "ens19", "hardware-address": mac, "ip-addresses": [{"ip-address": ip, "ip-address-type": "ipv4", "prefix": 24}]},
     ]}}))
     .into_response()
+}
+
+pub const VNC_TICKET: &str = "PVEVNC:5F000000::vncpassword";
+
+async fn vncproxy(
+    State(s): State<Shared>,
+    Path((_n, vmid)): Path<(String, u32)>,
+    headers: HeaderMap,
+) -> Response {
+    if !authorized(&headers) {
+        return err(StatusCode::UNAUTHORIZED, "no ticket");
+    }
+    let mut s = s.lock().unwrap();
+    let Some(vm) = s.vms.get(&vmid) else {
+        return missing(vmid);
+    };
+    if vm.status != "running" {
+        return err(StatusCode::INTERNAL_SERVER_ERROR, "VM is not running");
+    }
+    s.calls.push(format!("vncproxy {vmid}"));
+    Json(json!({"data": {"port": "5901", "ticket": VNC_TICKET, "user": TERM_USER}})).into_response()
+}
+
+async fn rfb_need(socket: &mut WebSocket, buffer: &mut Vec<u8>, count: usize) -> Option<Vec<u8>> {
+    while buffer.len() < count {
+        match socket.recv().await? {
+            Ok(WsMessage::Binary(data)) => buffer.extend_from_slice(&data),
+            _ => return None,
+        }
+    }
+    Some(buffer.drain(..count).collect())
+}
+
+/// A minimal RFB server with VNC authentication; ServerInit is a marker once ClientInit arrives.
+async fn rfb_server(mut socket: WebSocket) {
+    let challenge = [9u8; 16];
+    let bin = |v: &[u8]| WsMessage::Binary(v.to_vec().into());
+    let mut buffer: Vec<u8> = Vec::new();
+    let _ = socket.send(bin(b"RFB 003.008\n")).await;
+    if rfb_need(&mut socket, &mut buffer, 12).await.as_deref() != Some(b"RFB 003.008\n".as_slice())
+    {
+        return;
+    }
+    let _ = socket.send(bin(&[1, 2])).await;
+    if rfb_need(&mut socket, &mut buffer, 1).await.as_deref() != Some([2u8].as_slice()) {
+        return;
+    }
+    let _ = socket.send(bin(&challenge)).await;
+    let Some(answer) = rfb_need(&mut socket, &mut buffer, 16).await else {
+        return;
+    };
+    let ok = answer == tadokoro::vnc::vnc_response(VNC_TICKET, &challenge);
+    let _ = socket
+        .send(bin(if ok { &[0, 0, 0, 0] } else { &[0, 0, 0, 1] }))
+        .await;
+    if !ok || rfb_need(&mut socket, &mut buffer, 1).await.is_none() {
+        return;
+    }
+    let _ = socket.send(bin(b"SERVERINIT")).await;
 }

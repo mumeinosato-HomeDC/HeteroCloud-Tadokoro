@@ -16,8 +16,10 @@ pub mod pve;
 pub mod reconcile;
 pub mod shell;
 pub mod spec;
+pub mod vnc;
 
 pub const PROVIDER_RECONCILE_ACTION: &str = "service-instance.reconcile";
 pub const PROVIDER_DELETE_ACTION: &str = "service-instance.delete";
 pub const PROVIDER_STATUS_GET_ACTION: &str = "vm.status.get";
 pub const PROVIDER_SHELL_ACTION: &str = "vm.shell";
+pub const PROVIDER_CONSOLE_ACTION: &str = "vm.console";

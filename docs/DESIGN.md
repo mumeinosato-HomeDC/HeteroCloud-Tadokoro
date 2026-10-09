@@ -228,3 +228,11 @@ NIC takes effect at the next boot, like other NIC changes.
 - The lease is exposed as `external_ip_address` in the status.
 - Lab: `scripts/pve-external-setup.sh` creates a node-local SDN simple zone with SNAT and dnsmasq DHCP that stands
   in for the router (uplink: the node's own gateway).
+
+## Graphical console
+
+`GET /internal/v1/service-instances/{id}/console` (action `vm.console`, WebSocket) relays the Proxmox VNC proxy
+(`vncproxy` + `vncwebsocket`). Proxmox protects it with the proxy ticket as the VNC password. The relay answers the
+RFB "VNC authentication" challenge itself (DES with the ticket) and offers the browser security type "None", so the
+ticket never leaves the provider; afterwards the RFB stream is relayed unchanged. VMs get `vga: std` (applied at the
+next boot) while the serial console (`serial0`) stays available. The two consoles share the session limit.

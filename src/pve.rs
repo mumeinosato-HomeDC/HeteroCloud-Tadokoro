@@ -406,7 +406,6 @@ impl PveClient {
         .map(|_| ())
     }
 
-    /// Starts a serial terminal proxy for the VM and returns its one-time credentials.
     /// Network interfaces as the guest agent sees them; empty while the agent is not running.
     pub async fn agent_interfaces(&self, vmid: u32) -> Result<Vec<Value>, PveError> {
         match self
@@ -427,6 +426,7 @@ impl PveClient {
         }
     }
 
+    /// Starts a serial terminal proxy for the VM and returns its one-time credentials.
     pub async fn termproxy(&self, vmid: u32) -> Result<TermProxy, PveError> {
         let data = self
             .call(Method::POST, &self.qemu(vmid, "/termproxy"), &[])
@@ -445,6 +445,30 @@ impl PveClient {
             _ => Err(PveError::Unavailable(
                 "unexpected termproxy response".into(),
             )),
+        }
+    }
+
+    /// Starts a VNC proxy (the graphical console) for the VM; the ticket is also the VNC password.
+    pub async fn vncproxy(&self, vmid: u32) -> Result<TermProxy, PveError> {
+        let data = self
+            .call(
+                Method::POST,
+                &self.qemu(vmid, "/vncproxy"),
+                &[("websocket", "1".to_owned())],
+            )
+            .await?;
+        let field = |name: &str| data.get(name).cloned().unwrap_or(Value::Null);
+        let port = field("port")
+            .as_u64()
+            .or_else(|| field("port").as_str().and_then(|p| p.parse().ok()))
+            .and_then(|p| u16::try_from(p).ok());
+        match (port, field("ticket").as_str()) {
+            (Some(port), Some(ticket)) => Ok(TermProxy {
+                port,
+                ticket: ticket.to_owned(),
+                user: String::new(),
+            }),
+            _ => Err(PveError::Unavailable("unexpected vncproxy response".into())),
         }
     }
 
