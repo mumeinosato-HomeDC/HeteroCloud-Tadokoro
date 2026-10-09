@@ -135,13 +135,13 @@ async fn env(sessions: usize) -> Env {
     panic!("VM never converged");
 }
 
-fn shell_request(
+fn console_request(
     e: &Env,
     action: &str,
     generation: i64,
 ) -> tokio_tungstenite::tungstenite::handshake::client::Request {
     let url = format!(
-        "ws://{}/internal/v1/service-instances/{}/shell?generation={generation}",
+        "ws://{}/internal/v1/service-instances/{}/console?generation={generation}",
         e.addr, e.instance
     );
     let mut request = url.into_client_request().unwrap();
@@ -158,59 +158,48 @@ fn shell_request(
 }
 
 #[tokio::test]
-async fn the_shell_relays_input_output_and_resizes() {
+async fn the_graphical_console_authenticates_for_the_browser() {
     let e = env(4).await;
-    let (mut socket, _) = tokio_tungstenite::connect_async(shell_request(&e, "vm.shell", 1))
+    let (mut socket, _) = tokio_tungstenite::connect_async(console_request(&e, "vm.console", 1))
         .await
         .unwrap();
-
-    socket
-        .send(Message::Binary(b"echo hi\n".to_vec().into()))
-        .await
-        .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    // The handshake's "OK" is swallowed; what arrives is the terminal output (binary).
-    assert_eq!(reply, Message::Binary(b"echo:echo hi\n".to_vec().into()));
-
-    socket
-        .send(Message::Text(
-            r#"{"type":"resize","cols":120,"rows":40}"#.into(),
-        ))
-        .await
-        .unwrap();
-    // Multi-byte input is counted in bytes by the frame.
-    socket
-        .send(Message::Binary("é".as_bytes().to_vec().into()))
-        .await
-        .unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(5), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    assert_eq!(reply, Message::Binary("echo:é".as_bytes().to_vec().into()));
-    assert!(
-        e.pve
-            .lock()
+    async fn next(
+        socket: &mut (
+                 impl futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+                 + Unpin
+             ),
+    ) -> Vec<u8> {
+        let message = tokio::time::timeout(Duration::from_secs(5), socket.next())
+            .await
             .unwrap()
-            .calls
-            .iter()
-            .any(|c| c.ends_with("120x40")),
-        "resize reached Proxmox"
+            .unwrap()
+            .unwrap();
+        message.into_data().to_vec()
+    }
+    assert_eq!(next(&mut socket).await, b"RFB 003.008\n");
+    socket
+        .send(Message::Binary(b"RFB 003.008\n".to_vec().into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        next(&mut socket).await,
+        vec![1, 1],
+        "the browser is offered no authentication"
     );
-    socket.close(None).await.unwrap();
+    socket.send(Message::Binary(vec![1].into())).await.unwrap();
+    assert_eq!(next(&mut socket).await, vec![0, 0, 0, 0]);
+    // From here on the stream is relayed unchanged.
+    socket.send(Message::Binary(vec![1].into())).await.unwrap();
+    assert_eq!(next(&mut socket).await, b"SERVERINIT");
 }
 
 #[tokio::test]
-async fn shell_requires_a_running_vm_and_the_right_token() {
+async fn the_console_requires_a_running_vm_and_the_right_token() {
     let e = env(4).await;
     // Wrong action, wrong generation and a stopped VM are refused before any socket exists.
-    for (action, generation) in [("service-instance.reconcile", 1), ("vm.shell", 2)] {
-        let result = tokio_tungstenite::connect_async(shell_request(&e, action, generation)).await;
+    for (action, generation) in [("service-instance.reconcile", 1), ("vm.console", 2)] {
+        let result =
+            tokio_tungstenite::connect_async(console_request(&e, action, generation)).await;
         assert!(result.is_err(), "{action} generation {generation}");
     }
     {
@@ -220,7 +209,7 @@ async fn shell_requires_a_running_vm_and_the_right_token() {
         }
     }
     assert!(
-        tokio_tungstenite::connect_async(shell_request(&e, "vm.shell", 1))
+        tokio_tungstenite::connect_async(console_request(&e, "vm.console", 1))
             .await
             .is_err()
     );
@@ -230,21 +219,21 @@ async fn shell_requires_a_running_vm_and_the_right_token() {
             .unwrap()
             .calls
             .iter()
-            .any(|c| c.starts_with("termproxy")),
-        "no terminal was started"
+            .any(|c| c.starts_with("vncproxy")),
+        "no console was started"
     );
 }
 
 #[tokio::test]
-async fn open_shells_are_bounded() {
+async fn open_consoles_are_bounded() {
     let e = env(1).await;
-    let (_first, _) = tokio_tungstenite::connect_async(shell_request(&e, "vm.shell", 1))
+    let (_first, _) = tokio_tungstenite::connect_async(console_request(&e, "vm.console", 1))
         .await
         .unwrap();
     assert!(
-        tokio_tungstenite::connect_async(shell_request(&e, "vm.shell", 1))
+        tokio_tungstenite::connect_async(console_request(&e, "vm.console", 1))
             .await
             .is_err(),
-        "the second shell is refused"
+        "the second console is refused"
     );
 }

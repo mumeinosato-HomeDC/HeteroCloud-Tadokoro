@@ -468,6 +468,10 @@ impl Reconciler {
         if let Some(net0) = net0_with_firewall(config) {
             params.push(("net0", net0));
         }
+        if config.str("vga").as_deref() != Some("std") {
+            // The graphical console needs a display; the serial console stays (serial0).
+            params.push(("vga", "std".into()));
+        }
         if let Some(external) = &self.settings.external {
             params.push(("ipconfig1", "ip=dhcp".into()));
             if nic_bridge(config, "net1").as_deref() != Some(&external.bridge) {
@@ -940,9 +944,9 @@ impl Reconciler {
         Err(ReconcileError::NotReady)
     }
 
-    /// Verifies the caller may open a shell on this VM and returns its VMID: same tenant,
+    /// Verifies the caller may open the console of this VM and returns its VMID: same tenant,
     /// current generation, configured and running.
-    pub async fn shell_target(
+    pub async fn console_target(
         &self,
         claims: &ProviderClaims,
         generation: i64,
@@ -966,13 +970,14 @@ impl Reconciler {
         Ok(vm.vmid)
     }
 
-    pub async fn open_terminal(
+    /// Opens the graphical (VNC) console; the returned ticket is the VNC password.
+    pub async fn open_console(
         &self,
         vmid: u32,
-    ) -> Result<(crate::pve::TerminalSocket, crate::pve::TermProxy), ReconcileError> {
-        let proxy = self.pve.termproxy(vmid).await?;
-        let socket = self.pve.connect_terminal(vmid, &proxy).await?;
-        Ok((socket, proxy))
+    ) -> Result<(crate::pve::VncSocket, String), ReconcileError> {
+        let proxy = self.pve.vncproxy(vmid).await?;
+        let socket = self.pve.connect_vnc(vmid, &proxy).await?;
+        Ok((socket, proxy.ticket))
     }
 
     pub async fn status(

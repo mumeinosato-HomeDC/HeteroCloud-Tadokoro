@@ -511,7 +511,10 @@ async fn firewall_is_enforced_before_the_vm_starts() {
     assert_eq!(vm.ipsets["ipfilter-net0"], vec!["10.100.16.1".to_owned()]);
     // ssh in, dns udp+tcp, the ssh reply, drop private, accept the rest.
     assert_eq!(vm.fw_rules.len(), 6);
-    assert_eq!(vm.fw_rules[3]["sport"], "22", "answers to the allowed source may leave");
+    assert_eq!(
+        vm.fw_rules[3]["sport"], "22",
+        "answers to the allowed source may leave"
+    );
     assert_eq!(vm.fw_rules[3]["dest"], "10.0.128.0/24");
     assert_eq!(vm.fw_rules[0]["type"], "in");
     assert_eq!(vm.fw_rules[0]["dport"], "22");
@@ -850,6 +853,10 @@ async fn vms_get_an_external_nic_whose_lease_is_allowed_through_ipfilter() {
     let (vmid, vm) = vm_of(&h, instance);
     assert!(vm.config["net1"].contains("bridge=hcext") && vm.config["net1"].contains("firewall=1"));
     assert_eq!(vm.config["ipconfig1"], "ip=dhcp");
+    assert_eq!(
+        vm.config["vga"], "std",
+        "the graphical console needs a display"
+    );
     assert!(
         !vm.config["ipconfig0"].contains("gw="),
         "the default route comes from the external lease"
